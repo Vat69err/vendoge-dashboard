@@ -161,8 +161,8 @@ st.divider()
 # ============================================================
 # 5. TABS
 # ============================================================
-tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict = st.tabs(
-    ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions"]
+tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops = st.tabs(
+    ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions", "⚙️ Operations"]
 )
 
 # ---------- OVERVIEW ----------
@@ -558,4 +558,182 @@ with tab_predict:
             "− current estimated stock, rounded up to your pack size. "
             "Cross-check against your actual warehouse counts before placing real orders — "
             "the 'current stock' figure is an estimate based on the last recorded refill."
+        )
+
+# ============================================================
+# 7. OPERATIONS TAB
+# ============================================================
+with tab_ops:
+
+    # ---- 7a. Top-selling products per machine ----
+    st.subheader("🏆 Top-Selling Products per Machine")
+    top_n_sel = st.slider("Show top N products per machine", 3, 15, 5, key="ops_topn")
+
+    if "machine" in sales_df.columns and "product_name" in sales_df.columns:
+        top_per_machine = (
+            sales_df.groupby(["machine", "product_name"])["total_sales"]
+            .sum()
+            .reset_index()
+            .sort_values(["machine", "total_sales"], ascending=[True, False])
+        )
+        top_per_machine = (
+            top_per_machine.groupby("machine")
+            .head(top_n_sel)
+            .reset_index(drop=True)
+        )
+        machines_list = sorted(top_per_machine["machine"].unique())
+        cols = st.columns(min(len(machines_list), 3))
+        for i, machine in enumerate(machines_list):
+            col = cols[i % len(cols)]
+            with col:
+                mdf = top_per_machine[top_per_machine["machine"] == machine].copy()
+                fig_top = px.bar(
+                    mdf.sort_values("total_sales"),
+                    x="total_sales", y="product_name", orientation="h",
+                    title=f"{machine}",
+                    color_discrete_sequence=[PRIMARY],
+                )
+                fig_top.update_layout(
+                    xaxis_title="Sales (₹)", yaxis_title="",
+                    margin=dict(l=0, r=0, t=40, b=0),
+                    height=300,
+                )
+                st.plotly_chart(fig_top, use_container_width=True)
+    else:
+        st.info("Machine or product data not available.")
+
+    st.divider()
+
+    # ---- 7b. Ideal refill day ----
+    st.subheader("📅 Ideal Refill Day")
+    st.caption(
+        "Based on which days of the week your machines sell the most — "
+        "refill **before** these peaks to avoid stock-outs."
+    )
+
+    if not sales_df.empty:
+        sales_df["dow"] = sales_df["date"].dt.dayofweek
+        dow_labels = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
+        sales_df["dow_label"] = sales_df["dow"].map(dow_labels)
+
+        # Sales by day of week per machine
+        dow_by_machine = (
+            sales_df.groupby(["machine", "dow", "dow_label"])["total_qty"]
+            .mean()
+            .reset_index()
+            .sort_values("dow")
+        )
+
+        # Stockout by day of week
+        if not stockout_df.empty:
+            stockout_df["dow"] = stockout_df["date"].dt.dayofweek
+            stockout_df["dow_label"] = stockout_df["dow"].map(dow_labels)
+            stockout_dow = (
+                stockout_df.groupby(["dow", "dow_label"])
+                .size().reset_index(name="stockout_events")
+                .sort_values("dow")
+            )
+
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            fig_dow = px.bar(
+                dow_by_machine, x="dow_label", y="total_qty", color="machine",
+                barmode="group",
+                title="Avg Units Sold by Day of Week",
+                category_orders={"dow_label": list(dow_labels.values())},
+                color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C"],
+            )
+            fig_dow.update_layout(xaxis_title="", yaxis_title="Avg Units/Day")
+            st.plotly_chart(fig_dow, use_container_width=True)
+
+        with rc2:
+            if not stockout_df.empty:
+                fig_so_dow = px.bar(
+                    stockout_dow, x="dow_label", y="stockout_events",
+                    title="Stock-out Events by Day of Week",
+                    category_orders={"dow_label": list(dow_labels.values())},
+                    color_discrete_sequence=[ACCENT],
+                )
+                fig_so_dow.update_layout(xaxis_title="", yaxis_title="Stock-out Count")
+                st.plotly_chart(fig_so_dow, use_container_width=True)
+            else:
+                st.info("No stock-out data to show.")
+
+        # Derive a recommendation: peak sales day per machine → suggest refilling the day before
+        peak_days = (
+            sales_df.groupby(["machine", "dow", "dow_label"])["total_qty"]
+            .mean().reset_index()
+            .sort_values("total_qty", ascending=False)
+            .groupby("machine").first().reset_index()
+        )
+        st.markdown("**Refill recommendations based on your sales pattern:**")
+        for _, row in peak_days.iterrows():
+            peak_dow = int(row["dow"])
+            refill_dow = dow_labels[(peak_dow - 1) % 7]
+            st.markdown(
+                f"- **{row['machine']}**: peak sales on **{row['dow_label']}** → "
+                f"refill by **{refill_dow}** morning"
+            )
+
+    st.divider()
+
+    # ---- 7c. Machine efficiency scorecard ----
+    st.subheader("📊 Machine Efficiency Scorecard")
+    st.caption("How each machine compares across sales, refill frequency, and stock-out rate.")
+
+    if "machine" in sales_df.columns:
+        scorecard = sales_df.groupby("machine").agg(
+            total_sales=("total_sales", "sum"),
+            total_qty=("total_qty", "sum"),
+            active_days=("date", "nunique"),
+        ).reset_index()
+        scorecard["avg_daily_sales"] = (
+            scorecard["total_sales"] / scorecard["active_days"]
+        ).round(0)
+
+        refill_counts = refill_df.groupby(
+            refill_df["date"].dt.to_period("W")
+        ).size().reset_index(name="refills_per_week") if not refill_df.empty else pd.DataFrame()
+
+        if "machine" in stockout_df.columns:
+            so_counts = (
+                stockout_df.groupby("machine").size().reset_index(name="stockout_events")
+            )
+            scorecard = scorecard.merge(so_counts, on="machine", how="left")
+            scorecard["stockout_events"] = scorecard["stockout_events"].fillna(0).astype(int)
+            scorecard["stockout_rate"] = (
+                scorecard["stockout_events"] / scorecard["active_days"]
+            ).round(2)
+        else:
+            scorecard["stockout_events"] = 0
+            scorecard["stockout_rate"] = 0.0
+
+        display_cols = {
+            "machine": "Machine",
+            "total_sales": "Total Sales (₹)",
+            "avg_daily_sales": "Avg Daily Sales (₹)",
+            "total_qty": "Units Sold",
+            "active_days": "Active Days",
+            "stockout_events": "Stock-out Events",
+            "stockout_rate": "Stock-outs / Day",
+        }
+        st.dataframe(
+            scorecard.rename(columns=display_cols)[list(display_cols.values())]
+            .sort_values("Total Sales (₹)", ascending=False),
+            use_container_width=True, hide_index=True,
+        )
+
+        fig_sc = px.scatter(
+            scorecard,
+            x="avg_daily_sales", y="stockout_rate",
+            size="total_qty", color="machine", text="machine",
+            title="Avg Daily Sales vs Stock-out Rate (bubble = units sold)",
+            color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C"],
+        )
+        fig_sc.update_traces(textposition="top center")
+        fig_sc.update_layout(xaxis_title="Avg Daily Sales (₹)", yaxis_title="Stock-outs per Day")
+        st.plotly_chart(fig_sc, use_container_width=True)
+        st.caption(
+            "Machines in the top-left (high sales, low stock-outs) are running well. "
+            "Top-right means high sales but frequent stock-outs — prioritise refilling these."
         )
