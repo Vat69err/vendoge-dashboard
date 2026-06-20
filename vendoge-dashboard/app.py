@@ -604,136 +604,182 @@ with tab_ops:
 
     st.divider()
 
-    # ---- 7b. Ideal refill day ----
-    st.subheader("📅 Ideal Refill Day")
+    # ---- 7b. Suggested refill times ----
+    st.subheader("🕐 Suggested Refill Times")
     st.caption(
-        "Based on which days of the week your machines sell the most — "
-        "refill **before** these peaks to avoid stock-outs."
+        "Your sales data doesn't include time-of-day, so these windows are derived from "
+        "daily depletion rate, stockout patterns by day-of-week, and standard vending "
+        "operating hours (8 am – 8 pm). Adjust the assumptions below to match your routes."
     )
 
-    if not sales_df.empty:
-        sales_df["dow"] = sales_df["date"].dt.dayofweek
-        dow_labels = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
-        sales_df["dow_label"] = sales_df["dow"].map(dow_labels)
+    dow_labels = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
 
-        # Sales by day of week per machine
-        dow_by_machine = (
-            sales_df.groupby(["machine", "dow", "dow_label"])["total_qty"]
-            .mean()
-            .reset_index()
-            .sort_values("dow")
-        )
+    rt_c1, rt_c2, rt_c3 = st.columns(3)
+    with rt_c1:
+        ops_start = st.number_input("Machine operating hours: start", min_value=0, max_value=23, value=8, step=1, key="ops_start")
+    with rt_c2:
+        ops_end = st.number_input("End", min_value=1, max_value=24, value=20, step=1, key="ops_end")
+    with rt_c3:
+        default_refills = st.selectbox("Default refills per day (applied to all machines unless overridden)", [1, 2, 3], index=1, key="ops_refills")
 
-        # Stockout by day of week
-        if not stockout_df.empty:
-            stockout_df["dow"] = stockout_df["date"].dt.dayofweek
-            stockout_df["dow_label"] = stockout_df["dow"].map(dow_labels)
-            stockout_dow = (
-                stockout_df.groupby(["dow", "dow_label"])
-                .size().reset_index(name="stockout_events")
-                .sort_values("dow")
-            )
+    machines_all = sorted(sales_df["machine"].dropna().unique()) if "machine" in sales_df.columns else []
+    machine_refills = {}
+    if machines_all:
+        st.markdown("**Override refills per day per machine (optional):**")
+        override_cols = st.columns(min(len(machines_all), 4))
+        for i, m in enumerate(machines_all):
+            with override_cols[i % len(override_cols)]:
+                machine_refills[m] = st.selectbox(m, [1, 2, 3], index=default_refills - 1, key=f"refills_{m}")
 
-        rc1, rc2 = st.columns(2)
-        with rc1:
-            fig_dow = px.bar(
-                dow_by_machine, x="dow_label", y="total_qty", color="machine",
-                barmode="group",
-                title="Avg Units Sold by Day of Week",
-                category_orders={"dow_label": list(dow_labels.values())},
-                color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C"],
-            )
-            fig_dow.update_layout(xaxis_title="", yaxis_title="Avg Units/Day")
-            st.plotly_chart(fig_dow, use_container_width=True)
-
-        with rc2:
-            if not stockout_df.empty:
-                fig_so_dow = px.bar(
-                    stockout_dow, x="dow_label", y="stockout_events",
-                    title="Stock-out Events by Day of Week",
-                    category_orders={"dow_label": list(dow_labels.values())},
-                    color_discrete_sequence=[ACCENT],
-                )
-                fig_so_dow.update_layout(xaxis_title="", yaxis_title="Stock-out Count")
-                st.plotly_chart(fig_so_dow, use_container_width=True)
-            else:
-                st.info("No stock-out data to show.")
-
-        # Derive a recommendation: peak sales day per machine → suggest refilling the day before
-        peak_days = (
-            sales_df.groupby(["machine", "dow", "dow_label"])["total_qty"]
+    # Day-of-week demand index per machine (normalised avg qty)
+    if not sales_df.empty and "machine" in sales_df.columns:
+        sales_df["_dow"] = sales_df["date"].dt.dayofweek
+        dow_demand = (
+            sales_df.groupby(["machine", "_dow"])["total_qty"]
             .mean().reset_index()
-            .sort_values("total_qty", ascending=False)
-            .groupby("machine").first().reset_index()
         )
-        st.markdown("**Refill recommendations based on your sales pattern:**")
-        for _, row in peak_days.iterrows():
-            peak_dow = int(row["dow"])
-            refill_dow = dow_labels[(peak_dow - 1) % 7]
-            st.markdown(
-                f"- **{row['machine']}**: peak sales on **{row['dow_label']}** → "
-                f"refill by **{refill_dow}** morning"
+        # Stockout days by dow
+        if not stockout_df.empty and "machine" in stockout_df.columns:
+            stockout_df["_dow"] = stockout_df["date"].dt.dayofweek
+            so_dow_machine = (
+                stockout_df.groupby(["machine", "_dow"]).size().reset_index(name="so_count")
             )
+        else:
+            so_dow_machine = pd.DataFrame(columns=["machine", "_dow", "so_count"])
+
+        st.markdown("---")
+        st.markdown("**Recommended refill schedule:**")
+
+        for machine in machines_all:
+            n = machine_refills.get(machine, default_refills)
+            span = ops_end - ops_start
+            interval = span / n
+
+            # Which day of week has most stockouts or highest sales for this machine?
+            m_demand = dow_demand[dow_demand["machine"] == machine].sort_values("_dow")
+            m_so = so_dow_machine[so_dow_machine["machine"] == machine] if not so_dow_machine.empty else pd.DataFrame()
+
+            # Score each day: normalised sales + normalised stockouts
+            if not m_demand.empty:
+                max_qty = m_demand["total_qty"].max() or 1
+                m_demand = m_demand.copy()
+                m_demand["score"] = m_demand["total_qty"] / max_qty
+                if not m_so.empty:
+                    m_demand = m_demand.merge(m_so[["_dow", "so_count"]], on="_dow", how="left")
+                    m_demand["so_count"] = m_demand["so_count"].fillna(0)
+                    max_so = m_demand["so_count"].max() or 1
+                    m_demand["score"] += m_demand["so_count"] / max_so
+                peak_dow_row = m_demand.sort_values("score", ascending=False).iloc[0]
+                peak_dow_name = dow_labels[int(peak_dow_row["_dow"])]
+                prev_dow_name = dow_labels[(int(peak_dow_row["_dow"]) - 1) % 7]
+            else:
+                peak_dow_name = "—"
+                prev_dow_name = "—"
+
+            times = [f"{int(ops_start + i * interval):02d}:00" for i in range(n)]
+            time_str = " → ".join(times)
+
+            st.markdown(
+                f"**{machine}** ({n}×/day) &nbsp;|&nbsp; "
+                f"Refill at: **{time_str}** &nbsp;|&nbsp; "
+                f"Peak demand day: **{peak_dow_name}** → prioritise full load on **{prev_dow_name}** evening"
+            )
+
+        st.divider()
+
+        # Day-of-week demand chart
+        dow_all = (
+            sales_df.groupby(["machine", "_dow"])["total_qty"].mean().reset_index()
+        )
+        dow_all["day"] = dow_all["_dow"].map(dow_labels)
+        fig_dow2 = px.bar(
+            dow_all.sort_values("_dow"), x="day", y="total_qty", color="machine",
+            barmode="group",
+            title="Avg Units Sold by Day of Week (basis for time recommendations)",
+            category_orders={"day": list(dow_labels.values())},
+            color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C"],
+        )
+        fig_dow2.update_layout(xaxis_title="", yaxis_title="Avg Units Sold")
+        st.plotly_chart(fig_dow2, use_container_width=True)
 
     st.divider()
 
-    # ---- 7c. Machine efficiency scorecard ----
-    st.subheader("📊 Machine Efficiency Scorecard")
-    st.caption("How each machine compares across sales, refill frequency, and stock-out rate.")
+    # ---- 7c. Stock-out root cause ----
+    st.subheader("💸 Stock-out Root Cause — Lost Revenue Analysis")
+    st.caption(
+        "Products with both high demand AND frequent stock-outs are costing you the most. "
+        "Lost revenue is estimated as: stockout events × avg units/day × unit price."
+    )
 
-    if "machine" in sales_df.columns:
-        scorecard = sales_df.groupby("machine").agg(
-            total_sales=("total_sales", "sum"),
-            total_qty=("total_qty", "sum"),
-            active_days=("date", "nunique"),
-        ).reset_index()
-        scorecard["avg_daily_sales"] = (
-            scorecard["total_sales"] / scorecard["active_days"]
-        ).round(0)
-
-        refill_counts = refill_df.groupby(
-            refill_df["date"].dt.to_period("W")
-        ).size().reset_index(name="refills_per_week") if not refill_df.empty else pd.DataFrame()
-
-        if "machine" in stockout_df.columns:
-            so_counts = (
-                stockout_df.groupby("machine").size().reset_index(name="stockout_events")
+    if not stockout_df.empty and "product_name" in stockout_df.columns:
+        # Avg daily sales rate + price per product
+        prod_stats = (
+            sales_df.groupby("product_name")
+            .agg(
+                avg_daily_qty=("total_qty", lambda x: x.sum() / sales_df["date"].nunique()),
+                unit_price=("price", "mean"),
             )
-            scorecard = scorecard.merge(so_counts, on="machine", how="left")
-            scorecard["stockout_events"] = scorecard["stockout_events"].fillna(0).astype(int)
-            scorecard["stockout_rate"] = (
-                scorecard["stockout_events"] / scorecard["active_days"]
-            ).round(2)
-        else:
-            scorecard["stockout_events"] = 0
-            scorecard["stockout_rate"] = 0.0
+            .reset_index()
+        )
 
-        display_cols = {
-            "machine": "Machine",
-            "total_sales": "Total Sales (₹)",
-            "avg_daily_sales": "Avg Daily Sales (₹)",
-            "total_qty": "Units Sold",
-            "active_days": "Active Days",
-            "stockout_events": "Stock-out Events",
-            "stockout_rate": "Stock-outs / Day",
-        }
+        so_freq = (
+            stockout_df.groupby("product_name").size().reset_index(name="stockout_events")
+        )
+
+        lost = so_freq.merge(prod_stats, on="product_name", how="left")
+        lost["avg_daily_qty"] = lost["avg_daily_qty"].fillna(0)
+        lost["unit_price"] = lost["unit_price"].fillna(0)
+        # Assume each stockout event means ~1 day of lost sales for that product
+        lost["est_lost_revenue"] = (
+            lost["stockout_events"] * lost["avg_daily_qty"] * lost["unit_price"]
+        ).round(0)
+        lost = lost.sort_values("est_lost_revenue", ascending=False)
+
+        lc1, lc2 = st.columns(2)
+        with lc1:
+            fig_lost = px.bar(
+                lost.head(15).sort_values("est_lost_revenue"),
+                x="est_lost_revenue", y="product_name", orientation="h",
+                title="Top 15 Products by Estimated Lost Revenue",
+                color_discrete_sequence=[ACCENT],
+            )
+            fig_lost.update_layout(xaxis_title="Est. Lost Revenue (₹)", yaxis_title="")
+            st.plotly_chart(fig_lost, use_container_width=True)
+
+        with lc2:
+            fig_freq = px.bar(
+                lost.sort_values("stockout_events", ascending=False).head(15).sort_values("stockout_events"),
+                x="stockout_events", y="product_name", orientation="h",
+                title="Top 15 Products by Stock-out Frequency",
+                color_discrete_sequence=[PRIMARY],
+            )
+            fig_freq.update_layout(xaxis_title="Stock-out Events", yaxis_title="")
+            st.plotly_chart(fig_freq, use_container_width=True)
+
+        # Quadrant table: high freq + high lost revenue = most critical
+        lost["priority"] = lost.apply(
+            lambda r: "🔴 Critical" if r["stockout_events"] >= lost["stockout_events"].quantile(0.75)
+                        and r["est_lost_revenue"] >= lost["est_lost_revenue"].quantile(0.75)
+                      else ("🟠 Watch" if r["stockout_events"] >= lost["stockout_events"].median()
+                            else "🟢 Low"),
+            axis=1,
+        )
         st.dataframe(
-            scorecard.rename(columns=display_cols)[list(display_cols.values())]
-            .sort_values("Total Sales (₹)", ascending=False),
+            lost[["product_name", "stockout_events", "avg_daily_qty", "unit_price", "est_lost_revenue", "priority"]]
+            .rename(columns={
+                "product_name": "Product",
+                "stockout_events": "Stock-out Events",
+                "avg_daily_qty": "Avg Daily Qty Sold",
+                "unit_price": "Unit Price (₹)",
+                "est_lost_revenue": "Est. Lost Revenue (₹)",
+                "priority": "Priority",
+            })
+            .sort_values("Est. Lost Revenue (₹)", ascending=False),
             use_container_width=True, hide_index=True,
         )
-
-        fig_sc = px.scatter(
-            scorecard,
-            x="avg_daily_sales", y="stockout_rate",
-            size="total_qty", color="machine", text="machine",
-            title="Avg Daily Sales vs Stock-out Rate (bubble = units sold)",
-            color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C"],
-        )
-        fig_sc.update_traces(textposition="top center")
-        fig_sc.update_layout(xaxis_title="Avg Daily Sales (₹)", yaxis_title="Stock-outs per Day")
-        st.plotly_chart(fig_sc, use_container_width=True)
         st.caption(
-            "Machines in the top-left (high sales, low stock-outs) are running well. "
-            "Top-right means high sales but frequent stock-outs — prioritise refilling these."
+            "🔴 Critical = frequent stockouts AND high revenue impact. Fix these first. "
+            "Est. lost revenue assumes each stockout event costs one full day of average sales for that product."
         )
+    else:
+        st.info("No stock-out data available.")
