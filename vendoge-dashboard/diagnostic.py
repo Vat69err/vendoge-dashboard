@@ -1,14 +1,14 @@
 import requests
 
-# Paste your real Sheet ID below (same one you put in app.py)
-SHEET_ID = "1US77O6RV0ue_OdAAvF8u3H4YdR5MzmbIIaq6z7JzQHU"
+# Paste your real Sheet ID below (same as in .streamlit/secrets.toml)
+SHEET_ID = "YOUR_SHEET_ID_HERE"
 
 # Paste each tab's gid below. Click the tab in your browser and copy the
 # number after "#gid=" in the URL.
 GIDS = {
-    "Machine Wise Sales": "0",
-    "Consolidated Refilling": "2119871943",
-    "Out of Stock Log": "1944086957",
+    "Machine Wise Sales": "YOUR_SALES_GID_HERE",
+    "Consolidated Refilling": "YOUR_REFILL_GID_HERE",
+    "Out of Stock Log": "YOUR_STOCKOUT_GID_HERE",
 }
 
 for name, gid in GIDS.items():

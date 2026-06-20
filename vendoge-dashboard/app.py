@@ -19,19 +19,6 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-# ============================================================
-# 1. CONFIG — edit this line with your own Sheet ID
-# ============================================================
-SHEET_ID = "1US77O6RV0ue_OdAAvF8u3H4YdR5MzmbIIaq6z7JzQHU"
-
-# Find each gid by clicking the tab in your browser and reading the
-# "#gid=XXXXXXXXX" part of the URL.
-GIDS = {
-    "sales": "0",                       # Machine Wise Sales
-    "refill": "2119871943",  # Consolidated Refilling
-    "stockout": "1944086957",  # Out of Stock Log
-}
-
 PRIMARY = "#0E6E55"      # deep teal — vending green
 ACCENT = "#F2A93B"       # warm amber — restock/alert accent
 BG_CARD = "#F6F4EF"
@@ -41,6 +28,24 @@ st.set_page_config(
     page_icon="🥤",
     layout="wide",
 )
+
+# ============================================================
+# 1. CONFIG — loaded from Streamlit secrets
+# ============================================================
+try:
+    SHEET_ID = st.secrets["sheet_id"]
+    GIDS = {
+        "sales": str(st.secrets["gids"]["sales"]),
+        "refill": str(st.secrets["gids"]["refill"]),
+        "stockout": str(st.secrets["gids"]["stockout"]),
+    }
+except (KeyError, FileNotFoundError):
+    st.error(
+        "Missing secrets! This app needs `sheet_id` and `gids` set up in "
+        "Streamlit secrets — locally in `.streamlit/secrets.toml`, or on "
+        "Streamlit Cloud under your app's Settings > Secrets."
+    )
+    st.stop()
 
 # ============================================================
 # 2. DATA LOADING — pulls live CSV export of each tab
