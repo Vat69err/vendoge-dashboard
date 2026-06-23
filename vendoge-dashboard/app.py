@@ -38,6 +38,8 @@ try:
         "sales": str(st.secrets["gids"]["sales"]),
         "refill": str(st.secrets["gids"]["refill"]),
         "stockout": str(st.secrets["gids"]["stockout"]),
+        "stock_in": str(st.secrets["gids"].get("stock_in", "")),
+        "inventory": str(st.secrets["gids"].get("inventory", "")),
     }
 except (KeyError, FileNotFoundError):
     st.error(
@@ -76,11 +78,27 @@ def load_data():
     if "machine" in stockout.columns:
         stockout["machine"] = stockout["machine"].astype(str)
 
-    return sales, refill, stockout
+    stock_in = pd.DataFrame()
+    if GIDS.get("stock_in"):
+        stock_in = pd.read_csv(_sheet_url(GIDS["stock_in"]))
+        stock_in["date"] = pd.to_datetime(stock_in["date"], errors="coerce")
+        if "packets_added" in stock_in.columns:
+            stock_in["packets_added"] = pd.to_numeric(stock_in["packets_added"], errors="coerce").fillna(0)
+
+    inventory = pd.DataFrame()
+    if GIDS.get("inventory"):
+        inventory = pd.read_csv(_sheet_url(GIDS["inventory"]))
+        inventory["date"] = pd.to_datetime(inventory["date"], errors="coerce")
+        for col in ("units", "physical_count_yesterday_evening", "refilling_quantity",
+                    "new_stock_added", "final_in_warehouse"):
+            if col in inventory.columns:
+                inventory[col] = pd.to_numeric(inventory[col], errors="coerce").fillna(0)
+
+    return sales, refill, stockout, stock_in, inventory
 
 
 try:
-    sales_df, refill_df, stockout_df = load_data()
+    sales_df, refill_df, stockout_df, stock_in_df, inventory_df = load_data()
 except Exception as e:
     st.error(
         "Couldn't load the Google Sheet. Most likely causes:\n\n"
@@ -161,8 +179,8 @@ st.divider()
 # ============================================================
 # 5. TABS
 # ============================================================
-tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops = st.tabs(
-    ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions", "⚙️ Operations"]
+tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops, tab_inv = st.tabs(
+    ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions", "⚙️ Operations", "📦 Inventory & Stock"]
 )
 
 # ---------- OVERVIEW ----------
@@ -783,3 +801,256 @@ with tab_ops:
         )
     else:
         st.info("No stock-out data available.")
+
+# ============================================================
+# 8. INVENTORY & STOCK TAB
+# ============================================================
+with tab_inv:
+    no_stock_in = stock_in_df.empty
+    no_inventory = inventory_df.empty
+
+    if no_stock_in and no_inventory:
+        st.info(
+            "No inventory data loaded. Add `stock_in` and `inventory` GIDs under "
+            "`[gids]` in your Streamlit secrets to enable this tab."
+        )
+        st.stop()
+
+    # ---- 8a. KPI row ----
+    st.subheader("📊 Warehouse Snapshot")
+
+    inv_kpi = st.columns(5)
+
+    if not no_inventory:
+        latest_inv = (
+            inventory_df.sort_values("date")
+            .groupby("product_name")
+            .last()
+            .reset_index()
+        )
+        total_warehouse = latest_inv["final_in_warehouse"].sum()
+        products_tracked = len(latest_inv)
+        zero_stock = (latest_inv["final_in_warehouse"] <= 0).sum()
+        has_warning = latest_inv["warning_note"].astype(str).str.strip().replace("nan", "").ne("").sum() if "warning_note" in latest_inv.columns else 0
+    else:
+        total_warehouse = products_tracked = zero_stock = has_warning = 0
+
+    if not no_stock_in:
+        total_packets = stock_in_df["packets_added"].sum()
+        unknown_pct = (
+            stock_in_df["is_unknown_product"].astype(str).str.lower().isin(["true", "1", "yes"]).sum()
+            / max(len(stock_in_df), 1) * 100
+        ) if "is_unknown_product" in stock_in_df.columns else 0
+    else:
+        total_packets = unknown_pct = 0
+
+    inv_kpi[0].metric("Total Units in Warehouse", f"{total_warehouse:,.0f}")
+    inv_kpi[1].metric("Products Tracked", f"{products_tracked:,}")
+    inv_kpi[2].metric("Zero-stock Products", f"{zero_stock:,}", delta=f"-{zero_stock}" if zero_stock else None, delta_color="inverse")
+    inv_kpi[3].metric("Total Packets Received", f"{total_packets:,.0f}")
+    inv_kpi[4].metric("Unknown Product Entries", f"{unknown_pct:.1f}%", help="% of Stock In Log entries flagged is_unknown_product")
+
+    st.divider()
+
+    # ---- 8b. Warehouse levels ----
+    if not no_inventory:
+        st.subheader("🏪 Current Warehouse Levels")
+
+        col_wh1, col_wh2 = st.columns((3, 2))
+
+        with col_wh1:
+            top_wh = latest_inv.sort_values("final_in_warehouse", ascending=False).head(20)
+            fig_wh = px.bar(
+                top_wh.sort_values("final_in_warehouse"),
+                x="final_in_warehouse", y="product_name", orientation="h",
+                title="Top 20 Products by Units in Warehouse",
+                color_discrete_sequence=[PRIMARY],
+            )
+            fig_wh.update_layout(xaxis_title="Units", yaxis_title="", height=500)
+            st.plotly_chart(fig_wh, use_container_width=True)
+
+        with col_wh2:
+            # Days of cover: warehouse units / avg daily sales rate
+            avg_daily = (
+                sales_df.groupby("product_name")["total_qty"]
+                .sum()
+                .div(max(sales_df["date"].dt.date.nunique(), 1))
+                .reset_index()
+                .rename(columns={"total_qty": "avg_daily_qty"})
+            )
+            cover = latest_inv.merge(avg_daily, on="product_name", how="left")
+            cover["avg_daily_qty"] = cover["avg_daily_qty"].fillna(0)
+            cover["days_of_cover"] = cover.apply(
+                lambda r: r["final_in_warehouse"] / r["avg_daily_qty"]
+                if r["avg_daily_qty"] > 0 else np.inf,
+                axis=1,
+            )
+            cover["cover_label"] = cover["days_of_cover"].apply(
+                lambda d: "🔴 <3d" if d < 3 else ("🟠 3–7d" if d < 7 else "🟢 7d+")
+            )
+
+            cover_summary = cover["cover_label"].value_counts().reset_index()
+            cover_summary.columns = ["Status", "Products"]
+            fig_cover = px.pie(
+                cover_summary, names="Status", values="Products",
+                title="Days of Cover Distribution",
+                hole=0.5,
+                color="Status",
+                color_discrete_map={"🔴 <3d": "#B85C5C", "🟠 3–7d": ACCENT, "🟢 7d+": PRIMARY},
+            )
+            st.plotly_chart(fig_cover, use_container_width=True)
+
+            urgent = cover[cover["days_of_cover"] < 3].sort_values("days_of_cover")
+            if not urgent.empty:
+                st.markdown("**⚠️ Restock urgently (< 3 days cover):**")
+                st.dataframe(
+                    urgent[["product_name", "final_in_warehouse", "avg_daily_qty", "days_of_cover"]]
+                    .rename(columns={
+                        "product_name": "Product",
+                        "final_in_warehouse": "In Warehouse",
+                        "avg_daily_qty": "Avg Daily Sales",
+                        "days_of_cover": "Days Left",
+                    })
+                    .assign(**{"Days Left": lambda df: df["Days Left"].round(1)}),
+                    use_container_width=True, hide_index=True,
+                )
+
+        st.divider()
+
+        # ---- 8c. Inventory flow over time ----
+        st.subheader("🔄 Daily Inventory Flow")
+        st.caption("New stock added vs units dispatched to machines (refilling quantity), per day.")
+
+        daily_flow = (
+            inventory_df.groupby(inventory_df["date"].dt.date)[["new_stock_added", "refilling_quantity"]]
+            .sum().reset_index()
+        )
+        daily_flow.columns = ["date", "new_stock_added", "refilling_quantity"]
+        daily_flow_m = daily_flow.melt(id_vars="date", var_name="flow_type", value_name="units")
+        daily_flow_m["flow_type"] = daily_flow_m["flow_type"].map(
+            {"new_stock_added": "New Stock Received", "refilling_quantity": "Dispatched to Machines"}
+        )
+
+        fig_flow = px.bar(
+            daily_flow_m, x="date", y="units", color="flow_type", barmode="group",
+            title="Stock In vs Machine Dispatch per Day",
+            color_discrete_map={"New Stock Received": PRIMARY, "Dispatched to Machines": ACCENT},
+        )
+        fig_flow.update_layout(xaxis_title="", yaxis_title="Units", legend_title="")
+        st.plotly_chart(fig_flow, use_container_width=True)
+
+        # Net warehouse change
+        daily_flow["net_change"] = daily_flow["new_stock_added"] - daily_flow["refilling_quantity"]
+        fig_net = px.bar(
+            daily_flow, x="date", y="net_change",
+            title="Net Warehouse Change per Day (positive = building stock, negative = drawing down)",
+            color_discrete_sequence=[PRIMARY],
+        )
+        fig_net.update_layout(xaxis_title="", yaxis_title="Net Units")
+        fig_net.add_hline(y=0, line_dash="dash", line_color="gray")
+        st.plotly_chart(fig_net, use_container_width=True)
+
+        st.divider()
+
+        # ---- 8d. Warning flags ----
+        if "warning_note" in inventory_df.columns:
+            warned = (
+                inventory_df[
+                    inventory_df["warning_note"].astype(str).str.strip().replace("nan", "").ne("")
+                ]
+                .sort_values("date", ascending=False)
+            )
+            if not warned.empty:
+                st.subheader("⚠️ Products with Warning Notes")
+                st.dataframe(
+                    warned[["date", "product_name", "final_in_warehouse", "warning_note"]]
+                    .rename(columns={
+                        "date": "Date",
+                        "product_name": "Product",
+                        "final_in_warehouse": "Warehouse Units",
+                        "warning_note": "Warning",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+                st.divider()
+
+    # ---- 8e. Stock In Log ----
+    if not no_stock_in:
+        st.subheader("📥 Stock In Log — Inbound Trends")
+
+        si_c1, si_c2 = st.columns(2)
+
+        with si_c1:
+            daily_si = (
+                stock_in_df.groupby(stock_in_df["date"].dt.date)["packets_added"]
+                .sum().reset_index()
+            )
+            daily_si.columns = ["date", "packets_added"]
+            fig_si = px.bar(
+                daily_si, x="date", y="packets_added",
+                title="Packets Received per Day",
+                color_discrete_sequence=[PRIMARY],
+            )
+            fig_si.update_layout(xaxis_title="", yaxis_title="Packets")
+            st.plotly_chart(fig_si, use_container_width=True)
+
+        with si_c2:
+            top_si = (
+                stock_in_df.groupby("product_name")["packets_added"]
+                .sum().sort_values(ascending=False).head(15).reset_index()
+            )
+            fig_si2 = px.bar(
+                top_si.sort_values("packets_added"),
+                x="packets_added", y="product_name", orientation="h",
+                title="Top 15 Products by Packets Received",
+                color_discrete_sequence=[ACCENT],
+            )
+            fig_si2.update_layout(xaxis_title="Packets", yaxis_title="")
+            st.plotly_chart(fig_si2, use_container_width=True)
+
+        # Receive rate vs sales rate (turnover proxy)
+        if not no_inventory:
+            st.subheader("⚖️ Stock Received vs Sold — Inventory Turnover Proxy")
+            st.caption(
+                "Products far above the diagonal are accumulating stock; "
+                "below it means demand is outpacing inbound supply."
+            )
+            si_totals = (
+                stock_in_df.groupby("product_name")["packets_added"].sum().reset_index()
+                .rename(columns={"packets_added": "total_received"})
+            )
+            sales_totals = (
+                sales_df.groupby("product_name")["total_qty"].sum().reset_index()
+                .rename(columns={"total_qty": "total_sold"})
+            )
+            turnover = si_totals.merge(sales_totals, on="product_name", how="inner")
+            turnover = turnover[turnover["total_sold"] > 0]
+
+            if not turnover.empty:
+                fig_turn = px.scatter(
+                    turnover, x="total_sold", y="total_received",
+                    text="product_name",
+                    title="Stock Received vs Units Sold",
+                    color_discrete_sequence=[PRIMARY],
+                )
+                max_val = max(turnover["total_sold"].max(), turnover["total_received"].max()) * 1.1
+                fig_turn.add_shape(
+                    type="line", x0=0, y0=0, x1=max_val, y1=max_val,
+                    line=dict(color="gray", dash="dash"),
+                )
+                fig_turn.update_traces(textposition="top center")
+                fig_turn.update_layout(xaxis_title="Total Units Sold", yaxis_title="Total Packets Received")
+                st.plotly_chart(fig_turn, use_container_width=True)
+
+        # Unknown products
+        if "is_unknown_product" in stock_in_df.columns:
+            unknown = stock_in_df[
+                stock_in_df["is_unknown_product"].astype(str).str.lower().isin(["true", "1", "yes"])
+            ]
+            if not unknown.empty:
+                st.subheader("❓ Unknown Product Entries in Stock In Log")
+                st.caption("These entries couldn't be matched to a known product — worth cleaning up for accurate tracking.")
+                st.dataframe(
+                    unknown[["date", "raw_name", "packets_added"]].sort_values("date", ascending=False),
+                    use_container_width=True, hide_index=True,
+                )
