@@ -852,7 +852,64 @@ with tab_inv:
 
     st.divider()
 
-    # ---- 8b. Warehouse levels ----
+    # ---- 8b. Latest-day detail ----
+    if not no_inventory:
+        latest_date = inventory_df["date"].dropna().max().date()
+        latest_day_df = inventory_df[inventory_df["date"].dt.date == latest_date].copy()
+
+        st.subheader(f"📅 Latest Inventory Snapshot — {latest_date.strftime('%d %b %Y')}")
+        st.caption("Full per-product breakdown for the most recent date in the Inventory Log.")
+
+        ld_c1, ld_c2, ld_c3, ld_c4 = st.columns(4)
+        ld_c1.metric("Products Recorded", len(latest_day_df))
+        ld_c2.metric("Total in Warehouse", f"{latest_day_df['final_in_warehouse'].sum():,.0f}")
+        ld_c3.metric("Dispatched to Machines", f"{latest_day_df['refilling_quantity'].sum():,.0f}")
+        ld_c4.metric("New Stock Added", f"{latest_day_df['new_stock_added'].sum():,.0f}")
+
+        ld_col1, ld_col2 = st.columns(2)
+
+        with ld_col1:
+            fig_ld_wh = px.bar(
+                latest_day_df.sort_values("final_in_warehouse", ascending=True),
+                x="final_in_warehouse", y="product_name", orientation="h",
+                title="Warehouse Units per Product",
+                color_discrete_sequence=[PRIMARY],
+            )
+            fig_ld_wh.update_layout(xaxis_title="Units", yaxis_title="", height=max(300, len(latest_day_df) * 22))
+            st.plotly_chart(fig_ld_wh, use_container_width=True)
+
+        with ld_col2:
+            fig_ld_flow = px.bar(
+                latest_day_df.sort_values("refilling_quantity", ascending=True),
+                x="refilling_quantity", y="product_name", orientation="h",
+                title="Dispatched to Machines per Product",
+                color_discrete_sequence=[ACCENT],
+            )
+            fig_ld_flow.update_layout(xaxis_title="Units", yaxis_title="", height=max(300, len(latest_day_df) * 22))
+            st.plotly_chart(fig_ld_flow, use_container_width=True)
+
+        # Full detail table
+        display_cols = [c for c in [
+            "product_name", "physical_count_yesterday_evening", "new_stock_added",
+            "refilling_quantity", "final_in_warehouse", "units", "warning_note",
+        ] if c in latest_day_df.columns]
+        col_rename = {
+            "product_name": "Product",
+            "physical_count_yesterday_evening": "Physical Count (eve)",
+            "new_stock_added": "New Stock Added",
+            "refilling_quantity": "Dispatched to Machines",
+            "final_in_warehouse": "Final in Warehouse",
+            "units": "Units/Packet",
+            "warning_note": "Warning",
+        }
+        latest_day_display = latest_day_df[display_cols].rename(columns=col_rename).sort_values(
+            "Final in Warehouse", ascending=False
+        )
+        st.dataframe(latest_day_display, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+    # ---- 8c. Warehouse levels (all-time latest per product) ----
     if not no_inventory:
         st.subheader("🏪 Current Warehouse Levels")
 
@@ -917,7 +974,7 @@ with tab_inv:
 
         st.divider()
 
-        # ---- 8c. Inventory flow over time ----
+        # ---- 8d. Inventory flow over time ----
         st.subheader("🔄 Daily Inventory Flow")
         st.caption("New stock added vs units dispatched to machines (refilling quantity), per day.")
 
@@ -952,7 +1009,7 @@ with tab_inv:
 
         st.divider()
 
-        # ---- 8d. Warning flags ----
+        # ---- 8e. Warning flags ----
         if "warning_note" in inventory_df.columns:
             warned = (
                 inventory_df[
@@ -974,7 +1031,7 @@ with tab_inv:
                 )
                 st.divider()
 
-    # ---- 8e. Stock In Log ----
+    # ---- 8f. Stock In Log ----
     if not no_stock_in:
         st.subheader("📥 Stock In Log — Inbound Trends")
 
