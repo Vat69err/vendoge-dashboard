@@ -514,6 +514,77 @@ with tab_sales:
             st.dataframe(pd.DataFrame(_snap_rows), use_container_width=True, hide_index=True)
         st.divider()
 
+    # ---- Top products per machine with D-1/D-2/avg breakdown ----
+    if "machine" in sales_f.columns and "product_name" in sales_f.columns and not sales_f.empty:
+        st.subheader("🏆 Top-Selling Products per Machine")
+        _tp_n = st.slider("Show top N products per machine", 3, 15, 5, key="ms_topn")
+
+        # Derive shared date labels from overall daily series
+        _tp_daily = sales_f.groupby(sales_f["date"].dt.date)["total_sales"].sum()
+        _tp_ref = period_avgs(_tp_daily)
+        _tp_lat = _tp_ref["date_latest"].strftime("%-d %b") if _tp_ref["date_latest"] else "Latest"
+        _tp_m1 = (_tp_ref["date_m1"].strftime("%-d %b") + " (D−1)") if _tp_ref["date_m1"] else "D−1"
+        _tp_m2 = (_tp_ref["date_m2"].strftime("%-d %b") + " (D−2)") if _tp_ref["date_m2"] else "D−2"
+
+        _tp_machines = sorted(sales_f["machine"].dropna().unique())
+        _tp_cols = st.columns(min(len(_tp_machines), 3))
+
+        for _ti, _machine in enumerate(_tp_machines):
+            _mdf = sales_f[sales_f["machine"] == _machine]
+
+            # Top N products by total sales in the selected period
+            _top_prods = (
+                _mdf.groupby("product_name")["total_sales"]
+                .sum().sort_values(ascending=False).head(_tp_n).index.tolist()
+            )
+
+            with _tp_cols[_ti % len(_tp_cols)]:
+                # Bar chart: total sales over selected period
+                _bar_data = (
+                    _mdf[_mdf["product_name"].isin(_top_prods)]
+                    .groupby("product_name")["total_sales"].sum()
+                    .reset_index().sort_values("total_sales")
+                )
+                _fig_tp = px.bar(
+                    _bar_data, x="total_sales", y="product_name", orientation="h",
+                    title=f"{_machine}",
+                    color_discrete_sequence=[PRIMARY],
+                )
+                _fig_tp.update_layout(
+                    xaxis_title="Sales (₹)", yaxis_title="",
+                    margin=dict(l=0, r=0, t=40, b=0),
+                    height=max(220, len(_top_prods) * 38),
+                )
+                st.plotly_chart(_fig_tp, use_container_width=True)
+
+                # D-1 / D-2 / avg table
+                _tp_rows = []
+                for _prod in _top_prods:
+                    _ps = _mdf[_mdf["product_name"] == _prod].groupby(_mdf["date"].dt.date)["total_sales"].sum()
+                    _pa = period_avgs(_ps)
+                    _d = _pa["latest"] - _pa["day_m1"]
+                    _dpct = (
+                        f"{'▲' if _d >= 0 else '▼'} {abs(_d / _pa['day_m1'] * 100):.0f}%"
+                        if _pa["day_m1"] else "—"
+                    )
+                    _tp_rows.append({
+                        "Product": _prod,
+                        _tp_lat: f"₹{_pa['latest']:,.0f}",
+                        _tp_m1: f"₹{_pa['day_m1']:,.0f}",
+                        _tp_m2: f"₹{_pa['day_m2']:,.0f}",
+                        "Δ": _dpct,
+                        "Avg 3d": f"₹{_pa['avg_3d']:,.0f}",
+                        "Avg 7d": f"₹{_pa['avg_7d']:,.0f}",
+                        "Avg 15d": f"₹{_pa['avg_15d']:,.0f}",
+                        "Overall": f"₹{_pa['avg_all']:,.0f}",
+                    })
+                st.dataframe(
+                    pd.DataFrame(_tp_rows),
+                    use_container_width=True, hide_index=True,
+                )
+
+        st.divider()
+
     c1, c2 = st.columns(2)
     with c1:
         brand_sel = st.multiselect(
@@ -897,46 +968,7 @@ with tab_predict:
 # ============================================================
 with tab_ops:
 
-    # ---- 7a. Top-selling products per machine ----
-    st.subheader("🏆 Top-Selling Products per Machine")
-    top_n_sel = st.slider("Show top N products per machine", 3, 15, 5, key="ops_topn")
-
-    if "machine" in sales_df.columns and "product_name" in sales_df.columns:
-        top_per_machine = (
-            sales_df.groupby(["machine", "product_name"])["total_sales"]
-            .sum()
-            .reset_index()
-            .sort_values(["machine", "total_sales"], ascending=[True, False])
-        )
-        top_per_machine = (
-            top_per_machine.groupby("machine")
-            .head(top_n_sel)
-            .reset_index(drop=True)
-        )
-        machines_list = sorted(top_per_machine["machine"].unique())
-        cols = st.columns(min(len(machines_list), 3))
-        for i, machine in enumerate(machines_list):
-            col = cols[i % len(cols)]
-            with col:
-                mdf = top_per_machine[top_per_machine["machine"] == machine].copy()
-                fig_top = px.bar(
-                    mdf.sort_values("total_sales"),
-                    x="total_sales", y="product_name", orientation="h",
-                    title=f"{machine}",
-                    color_discrete_sequence=[PRIMARY],
-                )
-                fig_top.update_layout(
-                    xaxis_title="Sales (₹)", yaxis_title="",
-                    margin=dict(l=0, r=0, t=40, b=0),
-                    height=300,
-                )
-                st.plotly_chart(fig_top, use_container_width=True)
-    else:
-        st.info("Machine or product data not available.")
-
-    st.divider()
-
-    # ---- 7b. Suggested refill times ----
+    # ---- 7a. Suggested refill times ----
     st.subheader("🕐 Suggested Refill Times")
     st.caption(
         "Your sales data doesn't include time-of-day, so these windows are derived from "
