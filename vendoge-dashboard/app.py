@@ -10,10 +10,8 @@ Find it in your sheet's URL:
 https://docs.google.com/spreadsheets/d/  <-- THIS PART -->  /edit
 """
 
-import urllib.parse
 from datetime import datetime, timedelta
 
-import numpy as np
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -130,7 +128,7 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
 else:
     start_date, end_date = min_date.date(), max_date.date()
 
-all_machines = sorted(sales_df["machine"].dropna().unique().tolist())
+all_machines = sorted(sales_df["machine"].dropna().unique().tolist()) if "machine" in sales_df.columns else []
 machine_sel = st.sidebar.multiselect("Machines", all_machines, default=all_machines)
 
 if st.sidebar.button("🔄 Refresh data now"):
@@ -147,10 +145,12 @@ def in_range(df, col="date"):
 
 
 sales_f = in_range(sales_df)
-sales_f = sales_f[sales_f["machine"].isin(machine_sel)] if machine_sel else sales_f
+if machine_sel and "machine" in sales_f.columns:
+    sales_f = sales_f[sales_f["machine"].isin(machine_sel)]
 refill_f = in_range(refill_df)
 stockout_f = in_range(stockout_df)
-stockout_f = stockout_f[stockout_f["machine"].isin(machine_sel)] if machine_sel else stockout_f
+if machine_sel and "machine" in stockout_f.columns:
+    stockout_f = stockout_f[stockout_f["machine"].isin(machine_sel)]
 
 # ============================================================
 # 4. HEADER + KPI ROW
@@ -236,11 +236,11 @@ with tab_sales:
     c1, c2 = st.columns(2)
     with c1:
         brand_sel = st.multiselect(
-            "Brand", sorted(sales_f["brand_name"].dropna().unique().tolist())
+            "Brand", sorted(sales_f["brand_name"].dropna().unique().tolist()) if "brand_name" in sales_f.columns else []
         )
     with c2:
         cat_sel = st.multiselect(
-            "Category", sorted(sales_f["category"].dropna().unique().tolist())
+            "Category", sorted(sales_f["category"].dropna().unique().tolist()) if "category" in sales_f.columns else []
         )
 
     detail = sales_f.copy()
@@ -279,7 +279,7 @@ with tab_sales:
 with tab_refill:
     c1, c2 = st.columns(2)
     with c1:
-        refillers = sorted(refill_f["refiller_name"].dropna().unique().tolist())
+        refillers = sorted(refill_f["refiller_name"].dropna().unique().tolist()) if "refiller_name" in refill_f.columns else []
         refiller_sel = st.multiselect("Refiller", refillers, default=refillers)
     with c2:
         st.metric("Total Refill Value", f"₹{refill_f['amount'].sum():,.0f}")
@@ -365,10 +365,14 @@ with tab_predict:
     # ---- Shared calculations (use full, unfiltered history for accuracy) ----
     today = sales_df["date"].max()
 
-    sales_by_product_day = (
-        sales_df.groupby(["product_id", "product_name", sales_df["date"]])["total_qty"]
-        .sum().reset_index()
-    )
+    _pred_cols = {"product_id", "product_name", "total_qty"}
+    if _pred_cols.issubset(sales_df.columns):
+        sales_by_product_day = (
+            sales_df.groupby(["product_id", "product_name", sales_df["date"]])["total_qty"]
+            .sum().reset_index()
+        )
+    else:
+        sales_by_product_day = pd.DataFrame(columns=["product_id", "product_name", "date", "total_qty"])
 
     latest_refill = (
         refill_df.sort_values("date")
@@ -419,7 +423,7 @@ with tab_predict:
     forecast_col1, forecast_col2 = st.columns(2)
     with forecast_col1:
         forecast_machine = st.selectbox(
-            "Machine", ["All machines"] + sorted(sales_df["machine"].dropna().unique().tolist())
+            "Machine", ["All machines"] + (sorted(sales_df["machine"].dropna().unique().tolist()) if "machine" in sales_df.columns else [])
         )
     with forecast_col2:
         forecast_horizon = st.slider("Days to forecast ahead", 3, 21, 7)
