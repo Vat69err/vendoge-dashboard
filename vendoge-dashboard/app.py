@@ -257,7 +257,74 @@ def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}", inverse: bool 
 
 
 # ============================================================
-# 6. TABS
+# 6. SHARED PREDICTION HELPERS (used by Predictions + Inventory tabs)
+# ============================================================
+_pred_today = sales_df["date"].max()
+
+_pred_cols = {"product_id", "product_name", "total_qty"}
+if _pred_cols.issubset(sales_df.columns):
+    sales_by_product_day = (
+        sales_df.groupby(["product_id", "product_name", sales_df["date"]])["total_qty"]
+        .sum().reset_index()
+    )
+else:
+    sales_by_product_day = pd.DataFrame(columns=["product_id", "product_name", "date", "total_qty"])
+
+_refill_pred_cols = {"product_id", "product_name", "brand_name", "qty_after_refill"}
+if _refill_pred_cols.issubset(refill_df.columns) and not refill_df.empty:
+    latest_refill = (
+        refill_df.sort_values("date")
+        .groupby("product_id")
+        .tail(1)[["product_id", "product_name", "brand_name", "date", "qty_after_refill"]]
+        .rename(columns={"date": "last_refill_date"})
+    )
+else:
+    latest_refill = pd.DataFrame(columns=["product_id", "product_name", "brand_name", "last_refill_date", "qty_after_refill"])
+
+
+def build_stock_table(rate_window_days: int = 14) -> pd.DataFrame:
+    rows = []
+    for _, r in latest_refill.iterrows():
+        pid = r["product_id"]
+        prod_sales = sales_by_product_day[sales_by_product_day["product_id"] == pid]
+        sold_since_refill = prod_sales.loc[
+            prod_sales["date"] > r["last_refill_date"], "total_qty"
+        ].sum()
+        current_stock = max(r["qty_after_refill"] - sold_since_refill, 0)
+        recent = prod_sales.loc[
+            prod_sales["date"] > _pred_today - pd.Timedelta(days=rate_window_days)
+        ]
+        daily_rate = recent["total_qty"].sum() / rate_window_days
+        days_remaining = current_stock / daily_rate if daily_rate > 0 else np.inf
+        rows.append({
+            "product_id": pid,
+            "product_name": r["product_name"],
+            "brand_name": r["brand_name"],
+            "last_refill_date": r["last_refill_date"].date(),
+            "current_stock_est": int(current_stock),
+            "daily_sales_rate": round(daily_rate, 2),
+            "days_remaining": days_remaining,
+        })
+    return pd.DataFrame(rows)
+
+
+def urgency_label(days):
+    if not np.isfinite(days):
+        return "⚪ No recent sales"
+    if days <= 2:
+        return "🔴 Urgent"
+    if days <= 5:
+        return "🟠 Soon"
+    return "🟢 OK"
+
+
+# Pre-compute stock table at default 14-day window for cross-tab use
+_default_stock_table = build_stock_table(rate_window_days=14)
+if not _default_stock_table.empty:
+    _default_stock_table["urgency"] = _default_stock_table["days_remaining"].apply(urgency_label)
+
+# ============================================================
+# 7. TABS
 # ============================================================
 tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops, tab_inv = st.tabs(
     ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions", "⚙️ Operations", "📦 Inventory & Stock"]
@@ -661,63 +728,6 @@ with tab_predict:
         "your machines combined**, not per individual machine. Sales forecasts "
         "can still be split by machine."
     )
-
-    # ---- Shared calculations (use full, unfiltered history for accuracy) ----
-    today = sales_df["date"].max()
-
-    _pred_cols = {"product_id", "product_name", "total_qty"}
-    if _pred_cols.issubset(sales_df.columns):
-        sales_by_product_day = (
-            sales_df.groupby(["product_id", "product_name", sales_df["date"]])["total_qty"]
-            .sum().reset_index()
-        )
-    else:
-        sales_by_product_day = pd.DataFrame(columns=["product_id", "product_name", "date", "total_qty"])
-
-    latest_refill = (
-        refill_df.sort_values("date")
-        .groupby("product_id")
-        .tail(1)[["product_id", "product_name", "brand_name", "date", "qty_after_refill"]]
-        .rename(columns={"date": "last_refill_date"})
-    )
-
-    def build_stock_table(rate_window_days: int = 14) -> pd.DataFrame:
-        rows = []
-        for _, r in latest_refill.iterrows():
-            pid = r["product_id"]
-            prod_sales = sales_by_product_day[sales_by_product_day["product_id"] == pid]
-
-            sold_since_refill = prod_sales.loc[
-                prod_sales["date"] > r["last_refill_date"], "total_qty"
-            ].sum()
-            current_stock = max(r["qty_after_refill"] - sold_since_refill, 0)
-
-            recent = prod_sales.loc[
-                prod_sales["date"] > today - pd.Timedelta(days=rate_window_days)
-            ]
-            daily_rate = recent["total_qty"].sum() / rate_window_days
-
-            days_remaining = current_stock / daily_rate if daily_rate > 0 else np.inf
-
-            rows.append({
-                "product_id": pid,
-                "product_name": r["product_name"],
-                "brand_name": r["brand_name"],
-                "last_refill_date": r["last_refill_date"].date(),
-                "current_stock_est": int(current_stock),
-                "daily_sales_rate": round(daily_rate, 2),
-                "days_remaining": days_remaining,
-            })
-        return pd.DataFrame(rows)
-
-    def urgency_label(days):
-        if not np.isfinite(days):
-            return "⚪ No recent sales"
-        if days <= 2:
-            return "🔴 Urgent"
-        if days <= 5:
-            return "🟠 Soon"
-        return "🟢 OK"
 
     st.subheader("📈 Sales Forecast")
     forecast_col1, forecast_col2 = st.columns(2)
@@ -1156,6 +1166,55 @@ with tab_inv:
 
     st.divider()
 
+    # ---- 8a-ii. Data quality flags ----
+    if not no_inventory:
+        _neg_stock = latest_inv[latest_inv["final_in_warehouse"] < 0].copy()
+    else:
+        _neg_stock = pd.DataFrame()
+
+    _unknown_si = pd.DataFrame()
+    if not no_stock_in and "is_unknown_product" in stock_in_df.columns:
+        _unknown_si = stock_in_df[
+            stock_in_df["is_unknown_product"].astype(str).str.lower().isin(["true", "1", "yes"])
+        ]
+
+    if not _neg_stock.empty or not _unknown_si.empty:
+        with st.expander(
+            f"🔧 Data Quality Issues — {len(_neg_stock)} negative-stock products, "
+            f"{len(_unknown_si)} unknown stock-in entries",
+            expanded=True,
+        ):
+            st.caption(
+                "Negative warehouse quantities almost always mean a **product name mismatch**: "
+                "stock was dispatched or sold under one spelling, but received or counted under "
+                "a different spelling. Add the variant name to your canonical name map to fix the "
+                "accounting. Unknown stock-in entries have the same root cause — the name on the "
+                "inbound delivery couldn't be matched to any known product."
+            )
+            if not _neg_stock.empty:
+                st.markdown("**Products with negative warehouse quantity (name mapping needed):**")
+                _neg_display_cols = [c for c in [
+                    "product_name", "final_in_warehouse", "refilling_quantity", "new_stock_added"
+                ] if c in _neg_stock.columns]
+                st.dataframe(
+                    _neg_stock[_neg_display_cols].rename(columns={
+                        "product_name": "Product (check spelling)",
+                        "final_in_warehouse": "Final in Warehouse",
+                        "refilling_quantity": "Last Dispatched",
+                        "new_stock_added": "Last Stock Added",
+                    }).sort_values("Final in Warehouse"),
+                    use_container_width=True, hide_index=True,
+                )
+            if not _unknown_si.empty:
+                st.markdown("**Unknown product entries in Stock In Log (name mapping needed):**")
+                _unk_cols = [c for c in ["date", "raw_name", "packets_added"] if c in _unknown_si.columns]
+                st.dataframe(
+                    _unknown_si[_unk_cols].sort_values("date", ascending=False),
+                    use_container_width=True, hide_index=True,
+                )
+
+    st.divider()
+
     # ---- 8b. Latest-day detail ----
     if not no_inventory:
         latest_date = inventory_df["date"].dropna().max().date()
@@ -1275,6 +1334,46 @@ with tab_inv:
                     .assign(**{"Days Left": lambda df: df["Days Left"].round(1)}),
                     use_container_width=True, hide_index=True,
                 )
+
+        st.divider()
+
+        # ---- 8c-ii. Predictions cross-reference ----
+        st.subheader("🔮 Predictions Cross-reference")
+        st.caption(
+            "Compares the **actual warehouse count** (from the Inventory Log) against the "
+            "**estimated stock level** computed in the Predictions tab (last refill qty − units "
+            "sold since). Large gaps indicate name mismatches, unrecorded dispatches, or "
+            "refill data that's out of date. Urgency and suggested order are at the 14-day "
+            "default rate — go to the Predictions tab to adjust assumptions."
+        )
+
+        if not _default_stock_table.empty:
+            _xref = latest_inv[["product_name", "final_in_warehouse"]].merge(
+                _default_stock_table[["product_name", "current_stock_est", "daily_sales_rate", "days_remaining", "urgency"]],
+                on="product_name", how="outer",
+            )
+            _xref["gap"] = _xref["final_in_warehouse"].fillna(0) - _xref["current_stock_est"].fillna(0)
+            _xref["gap_flag"] = _xref["gap"].apply(
+                lambda g: "🔴 Large gap" if abs(g) > 20 else ("🟠 Minor gap" if abs(g) > 5 else "🟢 OK")
+            )
+            _xref["days_remaining"] = _xref["days_remaining"].apply(
+                lambda d: f"{d:.1f}d" if np.isfinite(d) else "∞"
+            )
+            st.dataframe(
+                _xref.rename(columns={
+                    "product_name": "Product",
+                    "final_in_warehouse": "Actual Warehouse",
+                    "current_stock_est": "Predicted Stock",
+                    "gap": "Gap (Actual − Predicted)",
+                    "gap_flag": "Gap Status",
+                    "daily_sales_rate": "Daily Sales Rate",
+                    "days_remaining": "Days Remaining",
+                    "urgency": "Urgency",
+                }).sort_values("Gap (Actual − Predicted)"),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("Predictions data not available — make sure your Refilling sheet has product_id, product_name, and qty_after_refill columns.")
 
         st.divider()
 
