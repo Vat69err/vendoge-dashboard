@@ -1560,11 +1560,42 @@ with tab_inv:
 with tab_verka:
     VERKA = "Verka"
 
-    # Filter all datasets to Verka only (case-insensitive)
-    vk_sales = sales_f[sales_f["brand_name"].str.strip().str.lower() == VERKA.lower()] if "brand_name" in sales_f.columns else pd.DataFrame()
-    vk_refill = refill_f[refill_f["brand_name"].str.strip().str.lower() == VERKA.lower()] if "brand_name" in refill_f.columns else pd.DataFrame()
-    vk_stockout = stockout_f[stockout_f["product_name"].isin(vk_sales["product_name"].unique())] if not vk_sales.empty and "product_name" in stockout_f.columns else pd.DataFrame()
-    vk_stock = _default_stock_table[_default_stock_table["brand_name"].str.strip().str.lower() == VERKA.lower()] if not _default_stock_table.empty and "brand_name" in _default_stock_table.columns else pd.DataFrame()
+    # Keywords that identify Verka products even when brand_name is missing/wrong.
+    # Edit this list in the sidebar expander to capture untagged products.
+    _VERKA_DEFAULT_KEYWORDS = ["verka", "varka", "milkfed"]
+
+    with st.sidebar.expander("🥛 Verka keyword mapping", expanded=False):
+        st.caption("Products whose name contains any of these keywords are treated as Verka, even if brand_name is blank or mismatched.")
+        _kw_input = st.text_area(
+            "Keywords (one per line, case-insensitive)",
+            value="\n".join(_VERKA_DEFAULT_KEYWORDS),
+            height=110,
+            key="verka_keywords",
+        )
+        _verka_keywords = [k.strip().lower() for k in _kw_input.splitlines() if k.strip()]
+
+    def _is_verka(name_series: pd.Series) -> pd.Series:
+        """True if product name contains any Verka keyword OR brand_name == 'Verka'."""
+        return name_series.str.lower().str.contains("|".join(_verka_keywords), na=False)
+
+    def _verka_mask(df: pd.DataFrame) -> pd.Series:
+        brand_ok = df["brand_name"].str.strip().str.lower() == VERKA.lower() if "brand_name" in df.columns else pd.Series(False, index=df.index)
+        name_ok  = _is_verka(df["product_name"]) if "product_name" in df.columns else pd.Series(False, index=df.index)
+        return brand_ok | name_ok
+
+    # Filter all datasets to Verka (brand tag OR keyword match)
+    vk_sales    = sales_f[_verka_mask(sales_f)].copy() if not sales_f.empty else pd.DataFrame()
+    vk_refill   = refill_f[_verka_mask(refill_f)].copy() if not refill_f.empty else pd.DataFrame()
+    vk_stockout = stockout_f[stockout_f["product_name"].isin(vk_sales["product_name"].unique())].copy() if not vk_sales.empty and "product_name" in stockout_f.columns else pd.DataFrame()
+    vk_stock    = _default_stock_table[_verka_mask(_default_stock_table)].copy() if not _default_stock_table.empty else pd.DataFrame()
+
+    # Show untagged-but-matched products so user knows what was auto-included
+    if not vk_sales.empty and "brand_name" in vk_sales.columns:
+        _untagged = vk_sales[vk_sales["brand_name"].str.strip().str.lower() != VERKA.lower()]["product_name"].unique()
+        if len(_untagged):
+            with st.expander(f"⚠️ {len(_untagged)} product(s) auto-included via keyword (brand_name not set to 'Verka')", expanded=False):
+                st.caption("These products matched a Verka keyword but their brand_name column isn't 'Verka'. Fix in the source sheet to remove this warning.")
+                st.write(sorted(_untagged.tolist()))
 
     if vk_sales.empty and vk_refill.empty:
         st.info("No Verka products found in the current data. Check that brand_name is set to 'Verka' in your sheets.")
@@ -1687,7 +1718,7 @@ with tab_verka:
         _vk_matrix["Total"] = _vk_matrix.sum(axis=1)
         _vk_matrix = _vk_matrix.sort_values("Total", ascending=False).drop(columns="Total")
         st.dataframe(
-            _vk_matrix.style.format("₹{:,.0f}").background_gradient(cmap="Greens", axis=None),
+            _vk_matrix.style.format("₹{:,.0f}"),
             use_container_width=True,
         )
 
