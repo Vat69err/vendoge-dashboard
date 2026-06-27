@@ -225,16 +225,49 @@ tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops, tab_inv
 
 # ---------- OVERVIEW ----------
 with tab_overview:
+    st.subheader("Daily Performance Snapshot")
+    st.caption("How today compares to recent averages — all figures are per-day totals.")
+
+    _snap_rows = []
     if "total_sales" in sales_f.columns and not sales_f.empty:
-        _daily_sales = sales_f.groupby(sales_f["date"].dt.date)["total_sales"].sum()
-        snapshot_row("Daily Sales (₹)", period_avgs(_daily_sales))
+        _a = period_avgs(sales_f.groupby(sales_f["date"].dt.date)["total_sales"].sum())
+        _snap_rows.append({
+            "Metric": "Sales (₹)",
+            "Latest Day": f"₹{_a['latest']:,.0f}",
+            "Avg — Last 3 Days": f"₹{_a['avg_3d']:,.0f}",
+            "Avg — Last 7 Days": f"₹{_a['avg_7d']:,.0f}",
+            "Avg — Last 15 Days": f"₹{_a['avg_15d']:,.0f}",
+            "Overall Daily Avg": f"₹{_a['avg_all']:,.0f}",
+        })
     if "total_qty" in sales_f.columns and not sales_f.empty:
-        _daily_qty = sales_f.groupby(sales_f["date"].dt.date)["total_qty"].sum()
-        snapshot_row("Units Sold", period_avgs(_daily_qty), fmt="{:,.0f}")
+        _a = period_avgs(sales_f.groupby(sales_f["date"].dt.date)["total_qty"].sum())
+        _snap_rows.append({
+            "Metric": "Units Sold",
+            "Latest Day": f"{_a['latest']:,.0f}",
+            "Avg — Last 3 Days": f"{_a['avg_3d']:,.1f}",
+            "Avg — Last 7 Days": f"{_a['avg_7d']:,.1f}",
+            "Avg — Last 15 Days": f"{_a['avg_15d']:,.1f}",
+            "Overall Daily Avg": f"{_a['avg_all']:,.1f}",
+        })
     if not stockout_f.empty:
-        _daily_so = stockout_f.groupby(stockout_f["date"].dt.date).size()
-        snapshot_row("Stock-out Events", period_avgs(_daily_so), fmt="{:,.1f}")
+        _a = period_avgs(stockout_f.groupby(stockout_f["date"].dt.date).size())
+        _snap_rows.append({
+            "Metric": "Stock-out Events",
+            "Latest Day": f"{_a['latest']:,.0f}",
+            "Avg — Last 3 Days": f"{_a['avg_3d']:,.1f}",
+            "Avg — Last 7 Days": f"{_a['avg_7d']:,.1f}",
+            "Avg — Last 15 Days": f"{_a['avg_15d']:,.1f}",
+            "Overall Daily Avg": f"{_a['avg_all']:,.1f}",
+        })
+
+    if _snap_rows:
+        st.dataframe(
+            pd.DataFrame(_snap_rows).set_index("Metric"),
+            use_container_width=True,
+        )
+
     st.divider()
+    st.subheader("Trends & Breakdown")
 
     col1, col2 = st.columns((2, 1))
 
