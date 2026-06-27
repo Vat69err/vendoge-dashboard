@@ -177,7 +177,47 @@ k5.metric("Stock-out Events", f"{stockout_count:,}")
 st.divider()
 
 # ============================================================
-# 5. TABS
+# 5. PERIOD-AVERAGE HELPERS
+# ============================================================
+
+def period_avgs(daily_series: pd.Series) -> dict:
+    """
+    Given a date-indexed daily Series, return latest value and per-day averages
+    for 3-day, 7-day, 15-day windows and the full history.
+    Windows are inclusive of the latest date.
+    """
+    if daily_series.empty:
+        return {"latest": 0.0, "avg_3d": 0.0, "avg_7d": 0.0, "avg_15d": 0.0, "avg_all": 0.0}
+    s = daily_series.sort_index()
+    latest_date = s.index.max()
+
+    def _avg(n):
+        cutoff = latest_date - timedelta(days=n - 1)
+        w = s[s.index >= cutoff]
+        return float(w.mean()) if len(w) else 0.0
+
+    return {
+        "latest": float(s.iloc[-1]),
+        "avg_3d": _avg(3),
+        "avg_7d": _avg(7),
+        "avg_15d": _avg(15),
+        "avg_all": float(s.mean()),
+    }
+
+
+def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}"):
+    """Render a labelled 5-column snapshot strip."""
+    st.caption(f"**{label}** — latest day vs rolling daily averages")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Latest Day", fmt.format(avgs["latest"]))
+    c2.metric("Avg Last 3 Days", fmt.format(avgs["avg_3d"]))
+    c3.metric("Avg Last 7 Days", fmt.format(avgs["avg_7d"]))
+    c4.metric("Avg Last 15 Days", fmt.format(avgs["avg_15d"]))
+    c5.metric("Overall Avg / Day", fmt.format(avgs["avg_all"]))
+
+
+# ============================================================
+# 6. TABS
 # ============================================================
 tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops, tab_inv = st.tabs(
     ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions", "⚙️ Operations", "📦 Inventory & Stock"]
@@ -185,6 +225,17 @@ tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops, tab_inv
 
 # ---------- OVERVIEW ----------
 with tab_overview:
+    if "total_sales" in sales_f.columns and not sales_f.empty:
+        _daily_sales = sales_f.groupby(sales_f["date"].dt.date)["total_sales"].sum()
+        snapshot_row("Daily Sales (₹)", period_avgs(_daily_sales))
+    if "total_qty" in sales_f.columns and not sales_f.empty:
+        _daily_qty = sales_f.groupby(sales_f["date"].dt.date)["total_qty"].sum()
+        snapshot_row("Units Sold", period_avgs(_daily_qty), fmt="{:,.0f}")
+    if not stockout_f.empty:
+        _daily_so = stockout_f.groupby(stockout_f["date"].dt.date).size()
+        snapshot_row("Stock-out Events", period_avgs(_daily_so), fmt="{:,.1f}")
+    st.divider()
+
     col1, col2 = st.columns((2, 1))
 
     with col1:
@@ -233,6 +284,28 @@ with tab_overview:
 
 # ---------- MACHINE SALES ----------
 with tab_sales:
+    if "total_sales" in sales_f.columns and "machine" in sales_f.columns and not sales_f.empty:
+        _ms_daily = sales_f.groupby(sales_f["date"].dt.date)["total_sales"].sum()
+        snapshot_row("Daily Sales — all selected machines (₹)", period_avgs(_ms_daily))
+
+        # Per-machine breakdown table
+        _machines_snap = sorted(sales_f["machine"].dropna().unique())
+        if len(_machines_snap) > 1:
+            _snap_rows = []
+            for _m in _machines_snap:
+                _s = sales_f[sales_f["machine"] == _m].groupby(sales_f["date"].dt.date)["total_sales"].sum()
+                _a = period_avgs(_s)
+                _snap_rows.append({
+                    "Machine": _m,
+                    "Latest Day (₹)": f"₹{_a['latest']:,.0f}",
+                    "Avg 3d (₹)": f"₹{_a['avg_3d']:,.0f}",
+                    "Avg 7d (₹)": f"₹{_a['avg_7d']:,.0f}",
+                    "Avg 15d (₹)": f"₹{_a['avg_15d']:,.0f}",
+                    "Overall Avg/Day (₹)": f"₹{_a['avg_all']:,.0f}",
+                })
+            st.dataframe(pd.DataFrame(_snap_rows), use_container_width=True, hide_index=True)
+        st.divider()
+
     c1, c2 = st.columns(2)
     with c1:
         brand_sel = st.multiselect(
@@ -286,6 +359,15 @@ with tab_refill:
 
     rf = refill_f[refill_f["refiller_name"].isin(refiller_sel)] if refiller_sel else refill_f
 
+    if not rf.empty:
+        if "amount" in rf.columns:
+            _rf_val = rf.groupby(rf["date"].dt.date)["amount"].sum()
+            snapshot_row("Daily Refill Value (₹)", period_avgs(_rf_val))
+        if "refill_qty" in rf.columns:
+            _rf_qty = rf.groupby(rf["date"].dt.date)["refill_qty"].sum()
+            snapshot_row("Daily Units Refilled", period_avgs(_rf_qty), fmt="{:,.0f}")
+        st.divider()
+
     by_refiller = rf.groupby("refiller_name")["amount"].sum().reset_index()
     fig7 = px.bar(
         by_refiller, x="refiller_name", y="amount",
@@ -312,6 +394,9 @@ with tab_stockout:
     if stockout_f.empty:
         st.info("No stock-out events in this date range. 🎉")
     else:
+        _so_daily = stockout_f.groupby(stockout_f["date"].dt.date).size()
+        snapshot_row("Daily Stock-out Events", period_avgs(_so_daily), fmt="{:,.1f}")
+        st.divider()
         c1, c2 = st.columns(2)
         with c1:
             by_day_machine = (
@@ -981,6 +1066,14 @@ with tab_inv:
         # ---- 8d. Inventory flow over time ----
         st.subheader("🔄 Daily Inventory Flow")
         st.caption("New stock added vs units dispatched to machines (refilling quantity), per day.")
+
+        if "new_stock_added" in inventory_df.columns:
+            _inv_in = inventory_df.groupby(inventory_df["date"].dt.date)["new_stock_added"].sum()
+            snapshot_row("Daily New Stock Received (units)", period_avgs(_inv_in), fmt="{:,.0f}")
+        if "refilling_quantity" in inventory_df.columns:
+            _inv_out = inventory_df.groupby(inventory_df["date"].dt.date)["refilling_quantity"].sum()
+            snapshot_row("Daily Dispatched to Machines (units)", period_avgs(_inv_out), fmt="{:,.0f}")
+        st.divider()
 
         daily_flow = (
             inventory_df.groupby(inventory_df["date"].dt.date)[["new_stock_added", "refilling_quantity"]]
