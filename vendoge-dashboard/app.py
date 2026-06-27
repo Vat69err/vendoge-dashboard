@@ -326,8 +326,8 @@ if not _default_stock_table.empty:
 # ============================================================
 # 7. TABS
 # ============================================================
-tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops, tab_inv = st.tabs(
-    ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions", "⚙️ Operations", "📦 Inventory & Stock"]
+tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops, tab_inv, tab_verka = st.tabs(
+    ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions", "⚙️ Operations", "📦 Inventory & Stock", "🥛 Verka"]
 )
 
 # ---------- OVERVIEW ----------
@@ -1554,3 +1554,214 @@ with tab_inv:
                     unknown[["date", "raw_name", "packets_added"]].sort_values("date", ascending=False),
                     use_container_width=True, hide_index=True,
                 )
+# ============================================================
+# 9. VERKA TAB
+# ============================================================
+with tab_verka:
+    VERKA = "Verka"
+
+    # Filter all datasets to Verka only (case-insensitive)
+    vk_sales = sales_f[sales_f["brand_name"].str.strip().str.lower() == VERKA.lower()] if "brand_name" in sales_f.columns else pd.DataFrame()
+    vk_refill = refill_f[refill_f["brand_name"].str.strip().str.lower() == VERKA.lower()] if "brand_name" in refill_f.columns else pd.DataFrame()
+    vk_stockout = stockout_f[stockout_f["product_name"].isin(vk_sales["product_name"].unique())] if not vk_sales.empty and "product_name" in stockout_f.columns else pd.DataFrame()
+    vk_stock = _default_stock_table[_default_stock_table["brand_name"].str.strip().str.lower() == VERKA.lower()] if not _default_stock_table.empty and "brand_name" in _default_stock_table.columns else pd.DataFrame()
+
+    if vk_sales.empty and vk_refill.empty:
+        st.info("No Verka products found in the current data. Check that brand_name is set to 'Verka' in your sheets.")
+        st.stop()
+
+    # ── MACRO: KPI row ──────────────────────────────────────────────────────────
+    st.subheader("🥛 Verka — Brand Overview")
+
+    vk_total_sales = vk_sales["total_sales"].sum() if "total_sales" in vk_sales.columns else 0
+    vk_total_qty   = vk_sales["total_qty"].sum() if "total_qty" in vk_sales.columns else 0
+    vk_products    = vk_sales["product_name"].nunique() if "product_name" in vk_sales.columns else 0
+    vk_so_count    = len(vk_stockout)
+    vk_refill_val  = vk_refill["amount"].sum() if "amount" in vk_refill.columns else 0
+    _all_sales_tot = sales_f["total_sales"].sum() if "total_sales" in sales_f.columns else 1
+    vk_share       = vk_total_sales / _all_sales_tot * 100 if _all_sales_tot else 0
+
+    vk_k1, vk_k2, vk_k3, vk_k4, vk_k5, vk_k6 = st.columns(6)
+    vk_k1.metric("Verka Revenue",        f"₹{vk_total_sales:,.0f}")
+    vk_k2.metric("Units Sold",           f"{vk_total_qty:,.0f}")
+    vk_k3.metric("Products",             f"{vk_products}")
+    vk_k4.metric("Share of Total Sales", f"{vk_share:.1f}%")
+    vk_k5.metric("Stock-out Events",     f"{vk_so_count}")
+    vk_k6.metric("Total Refill Value",   f"₹{vk_refill_val:,.0f}")
+
+    st.divider()
+
+    # ── MACRO: Daily snapshot strips ───────────────────────────────────────────
+    if not vk_sales.empty and "total_sales" in vk_sales.columns:
+        snapshot_row("Verka — Daily Sales (₹)", period_avgs(vk_sales.groupby(vk_sales["date"].dt.date)["total_sales"].sum()))
+    if not vk_sales.empty and "total_qty" in vk_sales.columns:
+        snapshot_row("Verka — Daily Units Sold", period_avgs(vk_sales.groupby(vk_sales["date"].dt.date)["total_qty"].sum()), fmt="{:,.0f}")
+
+    st.divider()
+
+    # ── MACRO: Sales trend + machine split ─────────────────────────────────────
+    vk_mc1, vk_mc2 = st.columns((2, 1))
+    with vk_mc1:
+        _vk_trend = vk_sales.groupby(vk_sales["date"].dt.date)["total_sales"].sum().reset_index()
+        _vk_trend.columns = ["date", "total_sales"]
+        fig_vk_trend = px.area(_vk_trend, x="date", y="total_sales",
+                               title="Verka Daily Sales Trend",
+                               color_discrete_sequence=[PRIMARY])
+        fig_vk_trend.update_layout(xaxis_title="", yaxis_title="Sales (₹)")
+        st.plotly_chart(fig_vk_trend, use_container_width=True)
+
+    with vk_mc2:
+        if "machine" in vk_sales.columns:
+            _vk_by_machine = vk_sales.groupby("machine")["total_sales"].sum().reset_index()
+            fig_vk_pie = px.pie(_vk_by_machine, names="machine", values="total_sales",
+                                title="Verka Sales by Machine", hole=0.5,
+                                color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C"])
+            st.plotly_chart(fig_vk_pie, use_container_width=True)
+
+    st.divider()
+
+    # ── MESO: Per-product revenue & units ──────────────────────────────────────
+    st.subheader("📦 Verka Products — Sales Breakdown")
+
+    vk_mp1, vk_mp2 = st.columns(2)
+    with vk_mp1:
+        _vk_prod_rev = vk_sales.groupby("product_name")["total_sales"].sum().sort_values(ascending=False).reset_index()
+        fig_vk_prod = px.bar(_vk_prod_rev.sort_values("total_sales"),
+                             x="total_sales", y="product_name", orientation="h",
+                             title="Revenue by Product", color_discrete_sequence=[PRIMARY])
+        fig_vk_prod.update_layout(xaxis_title="Sales (₹)", yaxis_title="")
+        st.plotly_chart(fig_vk_prod, use_container_width=True)
+
+    with vk_mp2:
+        _vk_prod_qty = vk_sales.groupby("product_name")["total_qty"].sum().sort_values(ascending=False).reset_index()
+        fig_vk_qty = px.bar(_vk_prod_qty.sort_values("total_qty"),
+                            x="total_qty", y="product_name", orientation="h",
+                            title="Units Sold by Product", color_discrete_sequence=[ACCENT])
+        fig_vk_qty.update_layout(xaxis_title="Units", yaxis_title="")
+        st.plotly_chart(fig_vk_qty, use_container_width=True)
+
+    # Product trend lines
+    _vk_prod_trend = vk_sales.groupby(["product_name", vk_sales["date"].dt.date])["total_sales"].sum().reset_index()
+    _vk_prod_trend.columns = ["product_name", "date", "total_sales"]
+    fig_vk_lines = px.line(_vk_prod_trend, x="date", y="total_sales",
+                           color="product_name", markers=False,
+                           title="Product Sales Trends Over Time")
+    fig_vk_lines.update_layout(xaxis_title="", yaxis_title="Sales (₹)", legend_title="Product")
+    st.plotly_chart(fig_vk_lines, use_container_width=True)
+
+    # Per-product D-1/D-2/avg table
+    st.caption("**Per-product daily snapshot**")
+    _vk_ref_avgs = period_avgs(vk_sales.groupby(vk_sales["date"].dt.date)["total_sales"].sum())
+    _vk_lat = _vk_ref_avgs["date_latest"].strftime("%-d %b") if _vk_ref_avgs["date_latest"] else "Latest"
+    _vk_m1  = (_vk_ref_avgs["date_m1"].strftime("%-d %b") + " (D−1)") if _vk_ref_avgs["date_m1"] else "D−1"
+    _vk_m2  = (_vk_ref_avgs["date_m2"].strftime("%-d %b") + " (D−2)") if _vk_ref_avgs["date_m2"] else "D−2"
+
+    _vk_prod_rows = []
+    for _prod in sorted(vk_sales["product_name"].dropna().unique()):
+        _ps = vk_sales[vk_sales["product_name"] == _prod].groupby(vk_sales["date"].dt.date)["total_sales"].sum()
+        _pa = period_avgs(_ps)
+        _d  = _pa["latest"] - _pa["day_m1"]
+        _dpct = f"{'▲' if _d >= 0 else '▼'} {abs(_d / _pa['day_m1'] * 100):.0f}%" if _pa["day_m1"] else "—"
+        _vk_prod_rows.append({
+            "Product": _prod,
+            _vk_lat: f"₹{_pa['latest']:,.0f}",
+            _vk_m1:  f"₹{_pa['day_m1']:,.0f}",
+            _vk_m2:  f"₹{_pa['day_m2']:,.0f}",
+            "Δ":           _dpct,
+            "Avg 3d":      f"₹{_pa['avg_3d']:,.0f}",
+            "Avg 7d":      f"₹{_pa['avg_7d']:,.0f}",
+            "Avg 15d":     f"₹{_pa['avg_15d']:,.0f}",
+            "Overall/Day": f"₹{_pa['avg_all']:,.0f}",
+        })
+    st.dataframe(pd.DataFrame(_vk_prod_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── MESO: Product × Machine matrix ─────────────────────────────────────────
+    if "machine" in vk_sales.columns:
+        st.subheader("🔀 Product × Machine Matrix")
+        _vk_matrix = (
+            vk_sales.groupby(["product_name", "machine"])["total_sales"]
+            .sum().unstack(fill_value=0)
+        )
+        _vk_matrix["Total"] = _vk_matrix.sum(axis=1)
+        _vk_matrix = _vk_matrix.sort_values("Total", ascending=False).drop(columns="Total")
+        st.dataframe(
+            _vk_matrix.style.format("₹{:,.0f}").background_gradient(cmap="Greens", axis=None),
+            use_container_width=True,
+        )
+
+        _vk_pm = vk_sales.groupby(["machine", "product_name"])["total_sales"].sum().reset_index()
+        fig_vk_pm = px.bar(_vk_pm, x="machine", y="total_sales", color="product_name",
+                           title="Revenue per Machine (stacked by product)", barmode="stack")
+        fig_vk_pm.update_layout(xaxis_title="", yaxis_title="Sales (₹)", legend_title="Product")
+        st.plotly_chart(fig_vk_pm, use_container_width=True)
+
+        st.divider()
+
+    # ── MICRO: Stock & refill status ────────────────────────────────────────────
+    st.subheader("📊 Verka — Stock & Refill Status")
+
+    if not vk_stock.empty:
+        _vk_sd = vk_stock.copy()
+        _vk_sd["days_remaining"] = _vk_sd["days_remaining"].apply(lambda d: f"{d:.1f}d" if np.isfinite(d) else "∞")
+        st.dataframe(
+            _vk_sd[[c for c in ["product_name","last_refill_date","current_stock_est",
+                                 "daily_sales_rate","days_remaining","urgency"] if c in _vk_sd.columns]]
+            .rename(columns={"product_name":"Product","last_refill_date":"Last Refill",
+                              "current_stock_est":"Est. Stock","daily_sales_rate":"Daily Sales Rate",
+                              "days_remaining":"Days Remaining","urgency":"Urgency"})
+            .sort_values("Est. Stock"),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.info("No refill data for Verka — check that brand_name is populated in the Refilling sheet.")
+
+    if not vk_refill.empty and "refill_qty" in vk_refill.columns:
+        _vk_ref_daily_s = vk_refill.groupby(vk_refill["date"].dt.date)["refill_qty"].sum()
+        if not _vk_ref_daily_s.empty:
+            snapshot_row("Verka — Daily Units Refilled", period_avgs(_vk_ref_daily_s), fmt="{:,.0f}")
+
+        _vk_rfp = vk_refill.groupby("product_name")["refill_qty"].sum().sort_values(ascending=False).reset_index()
+        if not _vk_rfp.empty:
+            fig_vk_rf = px.bar(_vk_rfp.sort_values("refill_qty"),
+                               x="refill_qty", y="product_name", orientation="h",
+                               title="Units Refilled by Product", color_discrete_sequence=[PRIMARY])
+            fig_vk_rf.update_layout(xaxis_title="Units Refilled", yaxis_title="")
+            st.plotly_chart(fig_vk_rf, use_container_width=True)
+
+    st.divider()
+
+    # ── MICRO: Stock-out analysis ───────────────────────────────────────────────
+    st.subheader("🚫 Verka — Stock-out Analysis")
+    if not vk_stockout.empty:
+        _vk_so1, _vk_so2 = st.columns(2)
+        with _vk_so1:
+            _vk_so_freq = vk_stockout["product_name"].value_counts().reset_index()
+            _vk_so_freq.columns = ["product_name", "events"]
+            fig_vk_so = px.bar(_vk_so_freq.sort_values("events"),
+                               x="events", y="product_name", orientation="h",
+                               title="Stock-out Frequency by Product",
+                               color_discrete_sequence=[ACCENT])
+            fig_vk_so.update_layout(xaxis_title="Events", yaxis_title="")
+            st.plotly_chart(fig_vk_so, use_container_width=True)
+
+        with _vk_so2:
+            _vk_so_d = vk_stockout.groupby(vk_stockout["date"].dt.date).size().reset_index(name="events")
+            fig_vk_so2 = px.bar(_vk_so_d, x="date", y="events",
+                                title="Verka Stock-outs Over Time",
+                                color_discrete_sequence=[PRIMARY])
+            fig_vk_so2.update_layout(xaxis_title="", yaxis_title="Events")
+            st.plotly_chart(fig_vk_so2, use_container_width=True)
+
+        st.dataframe(vk_stockout.sort_values("date", ascending=False),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.success("No stock-out events for Verka in this date range. 🎉")
+
+    st.divider()
+
+    # ── MICRO: Full transaction log ─────────────────────────────────────────────
+    with st.expander("📋 Full Verka Sales Log"):
+        st.dataframe(vk_sales.sort_values("date", ascending=False),
+                     use_container_width=True, hide_index=True)
