@@ -1749,15 +1749,71 @@ with tab_verka:
         st.info("No refill data for Verka — check that brand_name is populated in the Refilling sheet.")
 
     if not vk_refill.empty and "refill_qty" in vk_refill.columns:
-        _vk_ref_daily_s = vk_refill.groupby(vk_refill["date"].dt.date)["refill_qty"].sum()
-        if not _vk_ref_daily_s.empty:
-            snapshot_row("Verka — Daily Units Refilled", period_avgs(_vk_ref_daily_s), fmt="{:,.0f}")
+        # Overall daily snapshot strips
+        _vk_ref_daily_qty = vk_refill.groupby(vk_refill["date"].dt.date)["refill_qty"].sum()
+        if not _vk_ref_daily_qty.empty:
+            snapshot_row("Verka — Daily Units Refilled", period_avgs(_vk_ref_daily_qty), fmt="{:,.0f}")
+        if "amount" in vk_refill.columns:
+            _vk_ref_daily_amt = vk_refill.groupby(vk_refill["date"].dt.date)["amount"].sum()
+            if not _vk_ref_daily_amt.empty:
+                snapshot_row("Verka — Daily Refill Value (₹)", period_avgs(_vk_ref_daily_amt))
 
+        st.divider()
+
+        # Per-product D-1 / D-2 / avg refill breakdown table
+        st.subheader("🔁 Verka Refills — Per Product Breakdown")
+        _vk_rf_rows = []
+        for _pname in sorted(vk_refill["product_name"].dropna().unique()):
+            _prf = vk_refill[vk_refill["product_name"] == _pname]
+            _pa_qty = period_avgs(_prf.groupby(_prf["date"].dt.date)["refill_qty"].sum())
+            _pa_amt = period_avgs(_prf.groupby(_prf["date"].dt.date)["amount"].sum()) if "amount" in _prf.columns else None
+
+            _lbl_latest = str(_pa_qty["date_latest"]) if _pa_qty["date_latest"] else "Latest"
+            _lbl_m1     = str(_pa_qty["date_m1"])     if _pa_qty["date_m1"]     else "D-1"
+            _lbl_m2     = str(_pa_qty["date_m2"])     if _pa_qty["date_m2"]     else "D-2"
+
+            _dpct_qty = ""
+            if _pa_qty["day_m1"]:
+                _chg = (_pa_qty["latest"] - _pa_qty["day_m1"]) / _pa_qty["day_m1"] * 100
+                _dpct_qty = f"{'▲' if _chg >= 0 else '▼'} {abs(_chg):.1f}%"
+
+            _row = {
+                "Product":      _pname,
+                _lbl_latest:    f"{_pa_qty['latest']:,.0f} units",
+                _lbl_m1:        f"{_pa_qty['day_m1']:,.0f} units",
+                _lbl_m2:        f"{_pa_qty['day_m2']:,.0f} units",
+                "Δ qty":        _dpct_qty,
+                "Avg 3d (qty)": f"{_pa_qty['avg_3d']:,.0f}",
+                "Avg 7d (qty)": f"{_pa_qty['avg_7d']:,.0f}",
+                "Overall/Day (qty)": f"{_pa_qty['avg_all']:,.0f}",
+            }
+            if _pa_amt:
+                _dpct_amt = ""
+                if _pa_amt["day_m1"]:
+                    _chg2 = (_pa_amt["latest"] - _pa_amt["day_m1"]) / _pa_amt["day_m1"] * 100
+                    _dpct_amt = f"{'▲' if _chg2 >= 0 else '▼'} {abs(_chg2):.1f}%"
+                _row.update({
+                    f"{_lbl_latest} (₹)": f"₹{_pa_amt['latest']:,.0f}",
+                    f"{_lbl_m1} (₹)":    f"₹{_pa_amt['day_m1']:,.0f}",
+                    f"{_lbl_m2} (₹)":    f"₹{_pa_amt['day_m2']:,.0f}",
+                    "Δ value":            _dpct_amt,
+                    "Avg 3d (₹)":        f"₹{_pa_amt['avg_3d']:,.0f}",
+                    "Avg 7d (₹)":        f"₹{_pa_amt['avg_7d']:,.0f}",
+                    "Overall/Day (₹)":   f"₹{_pa_amt['avg_all']:,.0f}",
+                })
+            _vk_rf_rows.append(_row)
+
+        if _vk_rf_rows:
+            st.dataframe(pd.DataFrame(_vk_rf_rows), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # Refill bar chart
         _vk_rfp = vk_refill.groupby("product_name")["refill_qty"].sum().sort_values(ascending=False).reset_index()
         if not _vk_rfp.empty:
             fig_vk_rf = px.bar(_vk_rfp.sort_values("refill_qty"),
                                x="refill_qty", y="product_name", orientation="h",
-                               title="Units Refilled by Product", color_discrete_sequence=[PRIMARY])
+                               title="Units Refilled by Product (total period)", color_discrete_sequence=[PRIMARY])
             fig_vk_rf.update_layout(xaxis_title="Units Refilled", yaxis_title="")
             st.plotly_chart(fig_vk_rf, use_container_width=True)
 
