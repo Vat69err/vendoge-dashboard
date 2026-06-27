@@ -187,12 +187,18 @@ def period_avgs(daily_series: pd.Series) -> dict:
     Given a date-indexed daily Series, return the latest day value, the two
     preceding days, and per-day averages for 3-day, 7-day, 15-day windows
     and the full history.  Windows are inclusive of the latest date.
+    Also returns the actual calendar dates for latest/day_m1/day_m2 so labels
+    can show the real date instead of a relative offset.
     """
     if daily_series.empty:
-        return {"latest": 0.0, "day_m1": 0.0, "day_m2": 0.0,
-                "avg_3d": 0.0, "avg_7d": 0.0, "avg_15d": 0.0, "avg_all": 0.0}
+        return {
+            "latest": 0.0, "day_m1": 0.0, "day_m2": 0.0,
+            "avg_3d": 0.0, "avg_7d": 0.0, "avg_15d": 0.0, "avg_all": 0.0,
+            "date_latest": None, "date_m1": None, "date_m2": None,
+        }
     s = daily_series.sort_index()
     latest_date = s.index.max()
+    dates = s.index.tolist()
 
     def _avg(n):
         cutoff = latest_date - timedelta(days=n - 1)
@@ -207,19 +213,46 @@ def period_avgs(daily_series: pd.Series) -> dict:
         "avg_7d": _avg(7),
         "avg_15d": _avg(15),
         "avg_all": float(s.mean()),
+        "date_latest": dates[-1],
+        "date_m1": dates[-2] if len(dates) >= 2 else None,
+        "date_m2": dates[-3] if len(dates) >= 3 else None,
     }
 
 
-def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}"):
-    """Render a labelled 7-column snapshot strip: latest, day-1, day-2, 3d/7d/15d/all avgs."""
-    st.caption(f"**{label}** — latest day vs prior days and rolling averages")
+def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}", inverse: bool = False):
+    """
+    Render a labelled 7-column snapshot strip with delta arrows.
+    Latest shows Δ vs Day-1; Day-1 shows Δ vs Day-2; averages show trend vs next wider window.
+    Set inverse=True for metrics where a higher value is bad (e.g. stock-outs).
+    """
+    def _delta(a, b):
+        """Return (formatted_delta, delta_color) for a vs b."""
+        diff = a - b
+        if b == 0:
+            return None, "off"
+        pct = diff / abs(b) * 100
+        sign = "+" if pct >= 0 else ""
+        return f"{sign}{pct:.1f}%", "inverse" if inverse else "normal"
+
+    def _lbl(key):
+        d = avgs.get(key)
+        return d.strftime("%-d %b") if d else "—"
+
+    dc = "inverse" if inverse else "normal"
+    d_lat, col_lat = _delta(avgs["latest"], avgs["day_m1"])
+    d_m1, col_m1 = _delta(avgs["day_m1"], avgs["day_m2"])
+    d_3v7, col_3v7 = _delta(avgs["avg_3d"], avgs["avg_7d"])
+    d_7v15, col_7v15 = _delta(avgs["avg_7d"], avgs["avg_15d"])
+    d_15va, col_15va = _delta(avgs["avg_15d"], avgs["avg_all"])
+
+    st.caption(f"**{label}**")
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    c1.metric("Latest Day", fmt.format(avgs["latest"]))
-    c2.metric("Day −1", fmt.format(avgs["day_m1"]))
-    c3.metric("Day −2", fmt.format(avgs["day_m2"]))
-    c4.metric("Avg 3d", fmt.format(avgs["avg_3d"]))
-    c5.metric("Avg 7d", fmt.format(avgs["avg_7d"]))
-    c6.metric("Avg 15d", fmt.format(avgs["avg_15d"]))
+    c1.metric(_lbl("date_latest"), fmt.format(avgs["latest"]), delta=d_lat, delta_color=col_lat)
+    c2.metric(_lbl("date_m1") + " (D−1)", fmt.format(avgs["day_m1"]), delta=d_m1, delta_color=col_m1)
+    c3.metric(_lbl("date_m2") + " (D−2)", fmt.format(avgs["day_m2"]))
+    c4.metric("Avg 3d", fmt.format(avgs["avg_3d"]), delta=d_3v7, delta_color=col_3v7)
+    c5.metric("Avg 7d", fmt.format(avgs["avg_7d"]), delta=d_7v15, delta_color=col_7v15)
+    c6.metric("Avg 15d", fmt.format(avgs["avg_15d"]), delta=d_15va, delta_color=col_15va)
     c7.metric("Overall Avg/Day", fmt.format(avgs["avg_all"]))
 
 
@@ -235,14 +268,29 @@ with tab_overview:
     st.subheader("Daily Performance Snapshot")
     st.caption("How today compares to recent averages — all figures are per-day totals.")
 
+    # Derive column labels from actual dates in the sales series
+    _date_series = sales_f.groupby(sales_f["date"].dt.date)["total_sales"].sum() if "total_sales" in sales_f.columns and not sales_f.empty else pd.Series(dtype=float)
+    _ref = period_avgs(_date_series)
+    _col_latest = _ref["date_latest"].strftime("%-d %b") if _ref["date_latest"] else "Latest"
+    _col_m1 = (_ref["date_m1"].strftime("%-d %b") + " (D−1)") if _ref["date_m1"] else "D−1"
+    _col_m2 = (_ref["date_m2"].strftime("%-d %b") + " (D−2)") if _ref["date_m2"] else "D−2"
+
+    def _pct_delta(a, b):
+        if b == 0:
+            return "—"
+        pct = (a - b) / abs(b) * 100
+        sign = "▲" if pct >= 0 else "▼"
+        return f"{sign} {abs(pct):.1f}%"
+
     _snap_rows = []
     if "total_sales" in sales_f.columns and not sales_f.empty:
         _a = period_avgs(sales_f.groupby(sales_f["date"].dt.date)["total_sales"].sum())
         _snap_rows.append({
             "Metric": "Sales (₹)",
-            "Latest Day": f"₹{_a['latest']:,.0f}",
-            "Day −1": f"₹{_a['day_m1']:,.0f}",
-            "Day −2": f"₹{_a['day_m2']:,.0f}",
+            _col_latest: f"₹{_a['latest']:,.0f}",
+            _col_m1: f"₹{_a['day_m1']:,.0f}",
+            _col_m2: f"₹{_a['day_m2']:,.0f}",
+            "Δ vs D−1": _pct_delta(_a["latest"], _a["day_m1"]),
             "Avg 3d": f"₹{_a['avg_3d']:,.0f}",
             "Avg 7d": f"₹{_a['avg_7d']:,.0f}",
             "Avg 15d": f"₹{_a['avg_15d']:,.0f}",
@@ -252,9 +300,10 @@ with tab_overview:
         _a = period_avgs(sales_f.groupby(sales_f["date"].dt.date)["total_qty"].sum())
         _snap_rows.append({
             "Metric": "Units Sold",
-            "Latest Day": f"{_a['latest']:,.0f}",
-            "Day −1": f"{_a['day_m1']:,.0f}",
-            "Day −2": f"{_a['day_m2']:,.0f}",
+            _col_latest: f"{_a['latest']:,.0f}",
+            _col_m1: f"{_a['day_m1']:,.0f}",
+            _col_m2: f"{_a['day_m2']:,.0f}",
+            "Δ vs D−1": _pct_delta(_a["latest"], _a["day_m1"]),
             "Avg 3d": f"{_a['avg_3d']:,.1f}",
             "Avg 7d": f"{_a['avg_7d']:,.1f}",
             "Avg 15d": f"{_a['avg_15d']:,.1f}",
@@ -264,9 +313,10 @@ with tab_overview:
         _a = period_avgs(stockout_f.groupby(stockout_f["date"].dt.date).size())
         _snap_rows.append({
             "Metric": "Stock-out Events",
-            "Latest Day": f"{_a['latest']:,.0f}",
-            "Day −1": f"{_a['day_m1']:,.0f}",
-            "Day −2": f"{_a['day_m2']:,.0f}",
+            _col_latest: f"{_a['latest']:,.0f}",
+            _col_m1: f"{_a['day_m1']:,.0f}",
+            _col_m2: f"{_a['day_m2']:,.0f}",
+            "Δ vs D−1": _pct_delta(_a["latest"], _a["day_m1"]),
             "Avg 3d": f"{_a['avg_3d']:,.1f}",
             "Avg 7d": f"{_a['avg_7d']:,.1f}",
             "Avg 15d": f"{_a['avg_15d']:,.1f}",
@@ -367,18 +417,28 @@ with tab_sales:
         _ms_daily = sales_f.groupby(sales_f["date"].dt.date)["total_sales"].sum()
         snapshot_row("Daily Sales — all selected machines (₹)", period_avgs(_ms_daily))
 
-        # Per-machine breakdown table
+        # Per-machine breakdown table with real date labels
         _machines_snap = sorted(sales_f["machine"].dropna().unique())
         if len(_machines_snap) > 1:
+            # Derive date labels from the combined series
+            _all_daily = sales_f.groupby(sales_f["date"].dt.date)["total_sales"].sum()
+            _ref_a = period_avgs(_all_daily)
+            _mc_latest = _ref_a["date_latest"].strftime("%-d %b") if _ref_a["date_latest"] else "Latest"
+            _mc_m1 = (_ref_a["date_m1"].strftime("%-d %b") + " (D−1)") if _ref_a["date_m1"] else "D−1"
+            _mc_m2 = (_ref_a["date_m2"].strftime("%-d %b") + " (D−2)") if _ref_a["date_m2"] else "D−2"
+
             _snap_rows = []
             for _m in _machines_snap:
                 _s = sales_f[sales_f["machine"] == _m].groupby(sales_f["date"].dt.date)["total_sales"].sum()
                 _a = period_avgs(_s)
+                _d = _a["latest"] - _a["day_m1"]
+                _dpct = f"{'▲' if _d >= 0 else '▼'} {abs(_d / _a['day_m1'] * 100):.1f}%" if _a["day_m1"] else "—"
                 _snap_rows.append({
                     "Machine": _m,
-                    "Latest Day": f"₹{_a['latest']:,.0f}",
-                    "Day −1": f"₹{_a['day_m1']:,.0f}",
-                    "Day −2": f"₹{_a['day_m2']:,.0f}",
+                    _mc_latest: f"₹{_a['latest']:,.0f}",
+                    _mc_m1: f"₹{_a['day_m1']:,.0f}",
+                    _mc_m2: f"₹{_a['day_m2']:,.0f}",
+                    "Δ vs D−1": _dpct,
                     "Avg 3d": f"₹{_a['avg_3d']:,.0f}",
                     "Avg 7d": f"₹{_a['avg_7d']:,.0f}",
                     "Avg 15d": f"₹{_a['avg_15d']:,.0f}",
@@ -550,7 +610,7 @@ with tab_stockout:
         st.info("No stock-out events in this date range. 🎉")
     else:
         _so_daily = stockout_f.groupby(stockout_f["date"].dt.date).size()
-        snapshot_row("Daily Stock-out Events", period_avgs(_so_daily), fmt="{:,.1f}")
+        snapshot_row("Daily Stock-out Events", period_avgs(_so_daily), fmt="{:,.1f}", inverse=True)
         st.divider()
         c1, c2 = st.columns(2)
         with c1:
