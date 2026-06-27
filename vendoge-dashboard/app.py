@@ -129,10 +129,12 @@ else:
     start_date, end_date = min_date.date(), max_date.date()
 
 all_machines = sorted(sales_df["machine"].dropna().unique().tolist()) if "machine" in sales_df.columns else []
-machine_sel = st.sidebar.multiselect("Machines", all_machines, default=all_machines)
+machine_sel = st.sidebar.multiselect("Machines", all_machines, default=all_machines, key="sidebar_machines")
 
 if st.sidebar.button("🔄 Refresh data now"):
     st.cache_data.clear()
+    # Drop the machine multiselect state so it resets to the freshly-loaded machine names
+    st.session_state.pop("sidebar_machines", None)
     st.rerun()
 
 st.sidebar.caption(f"Last pulled: {datetime.now().strftime('%d %b %Y, %I:%M %p')}")
@@ -182,12 +184,13 @@ st.divider()
 
 def period_avgs(daily_series: pd.Series) -> dict:
     """
-    Given a date-indexed daily Series, return latest value and per-day averages
-    for 3-day, 7-day, 15-day windows and the full history.
-    Windows are inclusive of the latest date.
+    Given a date-indexed daily Series, return the latest day value, the two
+    preceding days, and per-day averages for 3-day, 7-day, 15-day windows
+    and the full history.  Windows are inclusive of the latest date.
     """
     if daily_series.empty:
-        return {"latest": 0.0, "avg_3d": 0.0, "avg_7d": 0.0, "avg_15d": 0.0, "avg_all": 0.0}
+        return {"latest": 0.0, "day_m1": 0.0, "day_m2": 0.0,
+                "avg_3d": 0.0, "avg_7d": 0.0, "avg_15d": 0.0, "avg_all": 0.0}
     s = daily_series.sort_index()
     latest_date = s.index.max()
 
@@ -198,6 +201,8 @@ def period_avgs(daily_series: pd.Series) -> dict:
 
     return {
         "latest": float(s.iloc[-1]),
+        "day_m1": float(s.iloc[-2]) if len(s) >= 2 else 0.0,
+        "day_m2": float(s.iloc[-3]) if len(s) >= 3 else 0.0,
         "avg_3d": _avg(3),
         "avg_7d": _avg(7),
         "avg_15d": _avg(15),
@@ -206,14 +211,16 @@ def period_avgs(daily_series: pd.Series) -> dict:
 
 
 def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}"):
-    """Render a labelled 5-column snapshot strip."""
-    st.caption(f"**{label}** — latest day vs rolling daily averages")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    """Render a labelled 7-column snapshot strip: latest, day-1, day-2, 3d/7d/15d/all avgs."""
+    st.caption(f"**{label}** — latest day vs prior days and rolling averages")
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Latest Day", fmt.format(avgs["latest"]))
-    c2.metric("Avg Last 3 Days", fmt.format(avgs["avg_3d"]))
-    c3.metric("Avg Last 7 Days", fmt.format(avgs["avg_7d"]))
-    c4.metric("Avg Last 15 Days", fmt.format(avgs["avg_15d"]))
-    c5.metric("Overall Avg / Day", fmt.format(avgs["avg_all"]))
+    c2.metric("Day −1", fmt.format(avgs["day_m1"]))
+    c3.metric("Day −2", fmt.format(avgs["day_m2"]))
+    c4.metric("Avg 3d", fmt.format(avgs["avg_3d"]))
+    c5.metric("Avg 7d", fmt.format(avgs["avg_7d"]))
+    c6.metric("Avg 15d", fmt.format(avgs["avg_15d"]))
+    c7.metric("Overall Avg/Day", fmt.format(avgs["avg_all"]))
 
 
 # ============================================================
@@ -234,30 +241,36 @@ with tab_overview:
         _snap_rows.append({
             "Metric": "Sales (₹)",
             "Latest Day": f"₹{_a['latest']:,.0f}",
-            "Avg — Last 3 Days": f"₹{_a['avg_3d']:,.0f}",
-            "Avg — Last 7 Days": f"₹{_a['avg_7d']:,.0f}",
-            "Avg — Last 15 Days": f"₹{_a['avg_15d']:,.0f}",
-            "Overall Daily Avg": f"₹{_a['avg_all']:,.0f}",
+            "Day −1": f"₹{_a['day_m1']:,.0f}",
+            "Day −2": f"₹{_a['day_m2']:,.0f}",
+            "Avg 3d": f"₹{_a['avg_3d']:,.0f}",
+            "Avg 7d": f"₹{_a['avg_7d']:,.0f}",
+            "Avg 15d": f"₹{_a['avg_15d']:,.0f}",
+            "Overall Avg/Day": f"₹{_a['avg_all']:,.0f}",
         })
     if "total_qty" in sales_f.columns and not sales_f.empty:
         _a = period_avgs(sales_f.groupby(sales_f["date"].dt.date)["total_qty"].sum())
         _snap_rows.append({
             "Metric": "Units Sold",
             "Latest Day": f"{_a['latest']:,.0f}",
-            "Avg — Last 3 Days": f"{_a['avg_3d']:,.1f}",
-            "Avg — Last 7 Days": f"{_a['avg_7d']:,.1f}",
-            "Avg — Last 15 Days": f"{_a['avg_15d']:,.1f}",
-            "Overall Daily Avg": f"{_a['avg_all']:,.1f}",
+            "Day −1": f"{_a['day_m1']:,.0f}",
+            "Day −2": f"{_a['day_m2']:,.0f}",
+            "Avg 3d": f"{_a['avg_3d']:,.1f}",
+            "Avg 7d": f"{_a['avg_7d']:,.1f}",
+            "Avg 15d": f"{_a['avg_15d']:,.1f}",
+            "Overall Avg/Day": f"{_a['avg_all']:,.1f}",
         })
     if not stockout_f.empty:
         _a = period_avgs(stockout_f.groupby(stockout_f["date"].dt.date).size())
         _snap_rows.append({
             "Metric": "Stock-out Events",
             "Latest Day": f"{_a['latest']:,.0f}",
-            "Avg — Last 3 Days": f"{_a['avg_3d']:,.1f}",
-            "Avg — Last 7 Days": f"{_a['avg_7d']:,.1f}",
-            "Avg — Last 15 Days": f"{_a['avg_15d']:,.1f}",
-            "Overall Daily Avg": f"{_a['avg_all']:,.1f}",
+            "Day −1": f"{_a['day_m1']:,.0f}",
+            "Day −2": f"{_a['day_m2']:,.0f}",
+            "Avg 3d": f"{_a['avg_3d']:,.1f}",
+            "Avg 7d": f"{_a['avg_7d']:,.1f}",
+            "Avg 15d": f"{_a['avg_15d']:,.1f}",
+            "Overall Avg/Day": f"{_a['avg_all']:,.1f}",
         })
 
     if _snap_rows:
@@ -315,6 +328,39 @@ with tab_overview:
         fig4.update_layout(xaxis_title="", yaxis_title="Sales (₹)")
         st.plotly_chart(fig4, use_container_width=True)
 
+    # Brand breakdown
+    if "brand_name" in sales_f.columns:
+        st.subheader("Sales by Brand")
+        br_c1, br_c2 = st.columns(2)
+        with br_c1:
+            brand_sales = (
+                sales_f.groupby("brand_name")["total_sales"]
+                .sum().sort_values(ascending=False).reset_index()
+            )
+            fig_br = px.bar(
+                brand_sales.sort_values("total_sales"),
+                x="total_sales", y="brand_name", orientation="h",
+                title="Total Sales by Brand",
+                color_discrete_sequence=[PRIMARY],
+            )
+            fig_br.update_layout(xaxis_title="Sales (₹)", yaxis_title="")
+            st.plotly_chart(fig_br, use_container_width=True)
+
+        with br_c2:
+            if "machine" in sales_f.columns:
+                brand_machine = (
+                    sales_f.groupby(["brand_name", "machine"])["total_sales"]
+                    .sum().reset_index()
+                )
+                fig_bm = px.bar(
+                    brand_machine, x="brand_name", y="total_sales", color="machine",
+                    barmode="stack",
+                    title="Brand Sales Split by Machine",
+                    color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C"],
+                )
+                fig_bm.update_layout(xaxis_title="", yaxis_title="Sales (₹)", legend_title="Machine")
+                st.plotly_chart(fig_bm, use_container_width=True)
+
 # ---------- MACHINE SALES ----------
 with tab_sales:
     if "total_sales" in sales_f.columns and "machine" in sales_f.columns and not sales_f.empty:
@@ -330,11 +376,13 @@ with tab_sales:
                 _a = period_avgs(_s)
                 _snap_rows.append({
                     "Machine": _m,
-                    "Latest Day (₹)": f"₹{_a['latest']:,.0f}",
-                    "Avg 3d (₹)": f"₹{_a['avg_3d']:,.0f}",
-                    "Avg 7d (₹)": f"₹{_a['avg_7d']:,.0f}",
-                    "Avg 15d (₹)": f"₹{_a['avg_15d']:,.0f}",
-                    "Overall Avg/Day (₹)": f"₹{_a['avg_all']:,.0f}",
+                    "Latest Day": f"₹{_a['latest']:,.0f}",
+                    "Day −1": f"₹{_a['day_m1']:,.0f}",
+                    "Day −2": f"₹{_a['day_m2']:,.0f}",
+                    "Avg 3d": f"₹{_a['avg_3d']:,.0f}",
+                    "Avg 7d": f"₹{_a['avg_7d']:,.0f}",
+                    "Avg 15d": f"₹{_a['avg_15d']:,.0f}",
+                    "Overall Avg/Day": f"₹{_a['avg_all']:,.0f}",
                 })
             st.dataframe(pd.DataFrame(_snap_rows), use_container_width=True, hide_index=True)
         st.divider()
@@ -372,6 +420,50 @@ with tab_sales:
         color_discrete_sequence=[PRIMARY, ACCENT],
     )
     st.plotly_chart(fig6, use_container_width=True)
+
+    if "brand_name" in detail.columns:
+        st.subheader("Brand Performance")
+        bd_c1, bd_c2 = st.columns(2)
+        with bd_c1:
+            brand_rev = (
+                detail.groupby("brand_name")["total_sales"]
+                .sum().sort_values(ascending=False).reset_index()
+            )
+            fig_bd1 = px.bar(
+                brand_rev.sort_values("total_sales"),
+                x="total_sales", y="brand_name", orientation="h",
+                title="Revenue by Brand",
+                color_discrete_sequence=[PRIMARY],
+            )
+            fig_bd1.update_layout(xaxis_title="Sales (₹)", yaxis_title="")
+            st.plotly_chart(fig_bd1, use_container_width=True)
+
+        with bd_c2:
+            brand_qty = (
+                detail.groupby("brand_name")["total_qty"]
+                .sum().sort_values(ascending=False).reset_index()
+            )
+            fig_bd2 = px.bar(
+                brand_qty.sort_values("total_qty"),
+                x="total_qty", y="brand_name", orientation="h",
+                title="Units Sold by Brand",
+                color_discrete_sequence=[ACCENT],
+            )
+            fig_bd2.update_layout(xaxis_title="Units", yaxis_title="")
+            st.plotly_chart(fig_bd2, use_container_width=True)
+
+        if "machine" in detail.columns:
+            brand_trend = (
+                detail.groupby(["brand_name", detail["date"].dt.date])["total_sales"]
+                .sum().reset_index()
+            )
+            brand_trend.columns = ["brand_name", "date", "total_sales"]
+            fig_bt = px.line(
+                brand_trend, x="date", y="total_sales", color="brand_name", markers=False,
+                title="Brand Sales Trend Over Time",
+            )
+            fig_bt.update_layout(xaxis_title="", yaxis_title="Sales (₹)", legend_title="Brand")
+            st.plotly_chart(fig_bt, use_container_width=True)
 
     st.subheader("Product-level detail")
     st.dataframe(
@@ -418,6 +510,36 @@ with tab_refill:
         color_discrete_sequence=[ACCENT],
     )
     st.plotly_chart(fig8, use_container_width=True)
+
+    if "brand_name" in rf.columns:
+        st.subheader("Refill by Brand")
+        rb_c1, rb_c2 = st.columns(2)
+        with rb_c1:
+            brand_refill_val = (
+                rf.groupby("brand_name")["amount"].sum().sort_values(ascending=False).reset_index()
+            )
+            fig_rb1 = px.bar(
+                brand_refill_val.sort_values("amount"),
+                x="amount", y="brand_name", orientation="h",
+                title="Refill Value by Brand (₹)",
+                color_discrete_sequence=[PRIMARY],
+            )
+            fig_rb1.update_layout(xaxis_title="Amount (₹)", yaxis_title="")
+            st.plotly_chart(fig_rb1, use_container_width=True)
+
+        with rb_c2:
+            if "refill_qty" in rf.columns:
+                brand_refill_qty = (
+                    rf.groupby("brand_name")["refill_qty"].sum().sort_values(ascending=False).reset_index()
+                )
+                fig_rb2 = px.bar(
+                    brand_refill_qty.sort_values("refill_qty"),
+                    x="refill_qty", y="brand_name", orientation="h",
+                    title="Units Refilled by Brand",
+                    color_discrete_sequence=[ACCENT],
+                )
+                fig_rb2.update_layout(xaxis_title="Units", yaxis_title="")
+                st.plotly_chart(fig_rb2, use_container_width=True)
 
     st.subheader("Refill log")
     st.dataframe(rf.sort_values("date", ascending=False), use_container_width=True)
