@@ -96,14 +96,23 @@ def load_data():
     accounts = pd.DataFrame()
     if GIDS.get("accounts"):
         accounts = pd.read_csv(_sheet_url(GIDS["accounts"]))
-        # Auto-detect and parse date column
+        # Auto-detect and parse date column (dayfirst handles DD/MM/YY bank-export format)
         _ac_date_col = next((c for c in accounts.columns if "date" in c.lower()), None)
         if _ac_date_col:
-            accounts[_ac_date_col] = pd.to_datetime(accounts[_ac_date_col], errors="coerce")
+            accounts[_ac_date_col] = pd.to_datetime(
+                accounts[_ac_date_col], dayfirst=True, errors="coerce"
+            )
         # Auto-detect and parse numeric columns
+        _AC_NUMERIC_KEYWORDS = [
+            "amount", "amt", "debit", "credit", "balance", " dr", " cr",
+            "withdrawal", "deposit", "net (",
+        ]
         for col in accounts.columns:
-            if any(k in col.lower() for k in ["amount", "amt", "debit", "credit", "balance", " dr", " cr"]):
-                accounts[col] = pd.to_numeric(accounts[col].astype(str).str.replace(",", ""), errors="coerce")
+            if any(k in col.lower() for k in _AC_NUMERIC_KEYWORDS):
+                accounts[col] = pd.to_numeric(
+                    accounts[col].astype(str).str.replace(",", "").str.replace("₹", "").str.strip(),
+                    errors="coerce",
+                )
 
     return sales, refill, stockout, stock_in, inventory, accounts
 
@@ -1182,13 +1191,14 @@ with tab_accounts:
             return None
 
         ac_date    = _find_ac_col("date")
-        ac_debit   = _find_ac_col("debit", " dr", "dr.")
-        ac_credit  = _find_ac_col("credit", " cr", "cr.")
+        ac_debit   = _find_ac_col("withdrawal", "debit", " dr", "dr.")
+        ac_credit  = _find_ac_col("deposit", "credit", " cr", "cr.")
         # Only use single amount col if no explicit debit/credit columns
-        ac_amount  = _find_ac_col("amount", "amt") if not (ac_debit and ac_credit) else None
+        ac_amount  = _find_ac_col("amount", "amt", "net (") if not (ac_debit and ac_credit) else None
         ac_balance = _find_ac_col("balance", "bal")
         ac_desc    = _find_ac_col("narration", "description", "particulars", "detail", "remark", "note", "memo")
         ac_cat     = _find_ac_col("category", "account", "head", "ledger", "group")
+        ac_bucket  = _find_ac_col("bucket")
 
         # --- Date filter ---
         if ac_date and not accounts_df[ac_date].isna().all():
@@ -1212,10 +1222,16 @@ with tab_accounts:
         else:
             ac_df = accounts_df.copy()
 
-        # Category filter
+        # Bucket + Category filters side by side
+        _fc1, _fc2 = st.columns(2)
+        if ac_bucket and ac_df[ac_bucket].nunique() > 1:
+            _all_buckets = sorted(ac_df[ac_bucket].dropna().unique().tolist())
+            _sel_buckets = _fc1.multiselect("Filter by bucket", _all_buckets, default=_all_buckets, key="ac_buckets")
+            if _sel_buckets:
+                ac_df = ac_df[ac_df[ac_bucket].isin(_sel_buckets)]
         if ac_cat and ac_df[ac_cat].nunique() > 1:
             _all_cats = sorted(ac_df[ac_cat].dropna().unique().tolist())
-            _sel_cats = st.multiselect("Filter by category / account", _all_cats, default=_all_cats, key="ac_cats")
+            _sel_cats = _fc2.multiselect("Filter by category", _all_cats, default=_all_cats, key="ac_cats")
             if _sel_cats:
                 ac_df = ac_df[ac_df[ac_cat].isin(_sel_cats)]
 
@@ -1288,6 +1304,42 @@ with tab_accounts:
                         )
                         fig_bal.update_layout(xaxis_title="", yaxis_title="Balance (₹)")
                         st.plotly_chart(fig_bal, use_container_width=True)
+
+        # --- Bucket breakdown (high-level: REV / COGS / CAPEX / OPEX etc.) ---
+        if ac_bucket and has_debit_credit:
+            st.subheader("📂 Breakdown by Bucket")
+            _bk_cr = ac_df.groupby(ac_bucket)[ac_credit].sum().reset_index().rename(columns={ac_credit: "Credits"})
+            _bk_dr = ac_df.groupby(ac_bucket)[ac_debit].sum().reset_index().rename(columns={ac_debit: "Debits"})
+            _bk_sum = _bk_cr.merge(_bk_dr, on=ac_bucket, how="outer").fillna(0)
+            _bk_sum["Net"] = _bk_sum["Credits"] - _bk_sum["Debits"]
+            _bk_sum = _bk_sum.sort_values("Net", ascending=False)
+
+            _bb1, _bb2 = st.columns(2)
+            with _bb1:
+                _bk_m = _bk_sum.melt(id_vars=ac_bucket, value_vars=["Credits", "Debits"], var_name="Type", value_name="Amount")
+                fig_bk = px.bar(
+                    _bk_m, x=ac_bucket, y="Amount", color="Type", barmode="group",
+                    title="Credits & Debits by Bucket",
+                    color_discrete_map={"Debits": "#B85C5C", "Credits": PRIMARY},
+                )
+                fig_bk.update_layout(xaxis_title="", yaxis_title="Amount (₹)", legend_title="")
+                st.plotly_chart(fig_bk, use_container_width=True)
+            with _bb2:
+                fig_bk_net = px.bar(
+                    _bk_sum, x=ac_bucket, y="Net",
+                    title="Net Flow by Bucket (Credits − Debits)",
+                    color="Net",
+                    color_continuous_scale=[[0, "#B85C5C"], [0.5, "#FAFAFA"], [1, PRIMARY]],
+                )
+                fig_bk_net.update_layout(xaxis_title="", yaxis_title="Net (₹)", coloraxis_showscale=False)
+                fig_bk_net.add_hline(y=0, line_dash="dash", line_color="gray")
+                st.plotly_chart(fig_bk_net, use_container_width=True)
+
+            _bk_disp = _bk_sum.copy()
+            for _col in ["Credits", "Debits", "Net"]:
+                _bk_disp[_col] = _bk_disp[_col].apply(lambda x: f"₹{x:,.0f}")
+            st.dataframe(_bk_disp.rename(columns={ac_bucket: "Bucket"}), use_container_width=True, hide_index=True)
+            st.divider()
 
         # --- Category breakdown ---
         if ac_cat:
@@ -1410,14 +1462,15 @@ with tab_accounts:
         with st.expander("ℹ️ Auto-detected column mapping", expanded=False):
             st.caption(
                 f"Date: `{ac_date or '—'}` | "
-                f"Debit: `{ac_debit or '—'}` | "
-                f"Credit: `{ac_credit or '—'}` | "
+                f"Withdrawal/Debit: `{ac_debit or '—'}` | "
+                f"Deposit/Credit: `{ac_credit or '—'}` | "
                 f"Amount: `{ac_amount or '—'}` | "
                 f"Balance: `{ac_balance or '—'}` | "
+                f"Bucket: `{ac_bucket or '—'}` | "
                 f"Category: `{ac_cat or '—'}` | "
                 f"Description: `{ac_desc or '—'}`\n\n"
                 "If a column is detected incorrectly, rename the column header in your Google Sheet to include "
-                "keywords like: `date`, `debit`, `credit`, `balance`, `amount`, `category`, `narration`."
+                "keywords like: `date`, `withdrawal`/`debit`, `deposit`/`credit`, `balance`, `bucket`, `category`, `narration`."
             )
 
 # ============================================================
