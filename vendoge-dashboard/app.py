@@ -766,14 +766,40 @@ with tab_refill:
     fig7.update_layout(xaxis_title="", yaxis_title="Amount (₹)")
     st.plotly_chart(fig7, use_container_width=True)
 
-    daily_refill = rf.groupby(rf["date"].dt.date)["refill_qty"].sum().reset_index()
-    daily_refill.columns = ["date", "refill_qty"]
-    fig8 = px.bar(
-        daily_refill, x="date", y="refill_qty",
-        title="Units Refilled per Day",
-        color_discrete_sequence=[ACCENT],
-    )
-    st.plotly_chart(fig8, use_container_width=True)
+    _rf_has_machine = "machine" in rf.columns and rf["machine"].notna().any()
+
+    if _rf_has_machine:
+        _rf_daily_m = rf.groupby([rf["date"].dt.date, "machine"])["refill_qty"].sum().reset_index()
+        _rf_daily_m.columns = ["date", "machine", "refill_qty"]
+        _rf_mc1, _rf_mc2 = st.columns(2)
+        with _rf_mc1:
+            fig8 = px.bar(
+                _rf_daily_m, x="date", y="refill_qty", color="machine",
+                title="Units Refilled per Day (by Machine)", barmode="stack",
+                color_discrete_sequence=px.colors.qualitative.Set2,
+            )
+            fig8.update_layout(xaxis_title="", yaxis_title="Units Refilled", legend_title="Machine")
+            st.plotly_chart(fig8, use_container_width=True)
+        with _rf_mc2:
+            _rf_machine_total = rf.groupby("machine")["refill_qty"].sum().sort_values(ascending=False).reset_index()
+            _rf_machine_total.columns = ["machine", "refill_qty"]
+            fig8b = px.bar(
+                _rf_machine_total, x="machine", y="refill_qty",
+                title="Combined Qty Refilled per Machine (total period)",
+                color_discrete_sequence=[ACCENT],
+            )
+            fig8b.update_layout(xaxis_title="", yaxis_title="Units Refilled")
+            st.plotly_chart(fig8b, use_container_width=True)
+    else:
+        daily_refill = rf.groupby(rf["date"].dt.date)["refill_qty"].sum().reset_index()
+        daily_refill.columns = ["date", "refill_qty"]
+        fig8 = px.bar(
+            daily_refill, x="date", y="refill_qty",
+            title="Units Refilled per Day",
+            color_discrete_sequence=[ACCENT],
+        )
+        st.plotly_chart(fig8, use_container_width=True)
+        st.metric("Combined Refill Qty (period)", f"{rf['refill_qty'].sum():,.0f} units")
 
     if "brand_name" in rf.columns:
         st.subheader("Refill by Brand")
