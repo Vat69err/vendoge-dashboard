@@ -1180,11 +1180,10 @@ with tab_accounts:
 
     if accounts_df.empty:
         st.info(
-            "No accounts data loaded. Add `accounts` to `[gids]` in your Streamlit secrets:\n\n"
-            "```toml\n[gids]\naccounts = \"1855506379\"\n```"
+            "No accounts data loaded. Add `accounts` to `[gids.accounts]` in your Streamlit secrets."
         )
     else:
-        # --- Column detection ---
+        # ── Column detection ────────────────────────────────────────────────────
         def _find_ac_col(*keywords):
             for c in accounts_df.columns:
                 cl = c.lower().strip()
@@ -1192,17 +1191,22 @@ with tab_accounts:
                     return c
             return None
 
-        ac_date    = _find_ac_col("date")
-        ac_debit   = _find_ac_col("withdrawal", "debit", " dr", "dr.")
-        ac_credit  = _find_ac_col("deposit", "credit", " cr", "cr.")
-        # Only use single amount col if no explicit debit/credit columns
-        ac_amount  = _find_ac_col("amount", "amt", "net (") if not (ac_debit and ac_credit) else None
-        ac_balance = _find_ac_col("balance", "bal")
-        ac_desc    = _find_ac_col("narration", "description", "particulars", "detail", "remark", "note", "memo")
-        ac_cat     = _find_ac_col("category", "account", "head", "ledger", "group")
-        ac_bucket  = _find_ac_col("bucket")
+        ac_date         = _find_ac_col("date")
+        ac_debit        = _find_ac_col("withdrawal", "debit", " dr", "dr.")
+        ac_credit       = _find_ac_col("deposit", "credit", " cr", "cr.")
+        ac_amount       = _find_ac_col("amount", "amt", "net (") if not (ac_debit and ac_credit) else None
+        ac_balance      = _find_ac_col("balance", "bal")
+        ac_desc         = _find_ac_col("narration", "description", "particulars", "detail", "remark", "note", "memo")
+        ac_cat          = _find_ac_col("category", "account", "head", "ledger", "group")
+        ac_bucket       = _find_ac_col("bucket")
+        ac_contact      = _find_ac_col("contact n", "vendor", "payee", "party")
+        ac_contact_type = _find_ac_col("contact type", "contact_type")
+        ac_ready        = _find_ac_col("ready to", "ready?", "import?")
 
-        # --- Date filter ---
+        has_debit_credit = bool(ac_debit and ac_credit)
+        has_amount       = bool(ac_amount)
+
+        # ── Date filter ─────────────────────────────────────────────────────────
         if ac_date and not accounts_df[ac_date].isna().all():
             ac_min = accounts_df[ac_date].dropna().min()
             ac_max = accounts_df[ac_date].dropna().max()
@@ -1224,7 +1228,6 @@ with tab_accounts:
         else:
             ac_df = accounts_df.copy()
 
-        # Bucket + Category filters side by side
         _fc1, _fc2 = st.columns(2)
         if ac_bucket and ac_df[ac_bucket].nunique() > 1:
             _all_buckets = sorted(ac_df[ac_bucket].dropna().unique().tolist())
@@ -1237,81 +1240,267 @@ with tab_accounts:
             if _sel_cats:
                 ac_df = ac_df[ac_df[ac_cat].isin(_sel_cats)]
 
-        # --- KPI row ---
-        has_debit_credit = bool(ac_debit and ac_credit)
-        has_amount = bool(ac_amount)
-
-        k1, k2, k3, k4 = st.columns(4)
+        # ── Pre-compute period stats used across multiple sections ──────────────
         if has_debit_credit:
-            _total_dr = pd.to_numeric(ac_df[ac_debit],  errors="coerce").fillna(0).sum()
-            _total_cr = pd.to_numeric(ac_df[ac_credit], errors="coerce").fillna(0).sum()
-            _net      = _total_cr - _total_dr
+            _ac_dr_s = pd.to_numeric(ac_df[ac_debit],  errors="coerce").fillna(0)
+            _ac_cr_s = pd.to_numeric(ac_df[ac_credit], errors="coerce").fillna(0)
+            _total_dr = _ac_dr_s.sum()
+            _total_cr = _ac_cr_s.sum()
+            _net_flow = _total_cr - _total_dr
+
+        _ac_period_days = max(
+            (ac_df[ac_date].dropna().max() - ac_df[ac_date].dropna().min()).days, 1
+        ) if ac_date and not ac_df[ac_date].isna().all() else 1
+        _ac_months = max(_ac_period_days / 30.44, 1)
+
+        # Current balance (last row sorted by date)
+        _current_bal = None
+        if ac_balance and ac_date:
+            _bal_sorted = ac_df.dropna(subset=[ac_date]).sort_values(ac_date)
+            _bal_vals = pd.to_numeric(_bal_sorted[ac_balance], errors="coerce").dropna()
+            if not _bal_vals.empty:
+                _current_bal = _bal_vals.iloc[-1]
+
+        # P&L bucket soft-classification (works even if bucket names change slightly)
+        def _bk_is(series, *patterns):
+            return series.astype(str).str.lower().str.strip().apply(
+                lambda b: any(p in b for p in patterns)
+            )
+
+        if ac_bucket:
+            _bk_col = ac_df[ac_bucket]
+            _rev_m   = _bk_is(_bk_col, "rev")
+            _cogs_m  = _bk_is(_bk_col, "cogs", "cost of")
+            _opex_m  = _bk_is(_bk_col, "opex", "oper")
+            _admin_m = _bk_is(_bk_col, "admin")
+            _capex_m = _bk_is(_bk_col, "capex")
+            _cap_m   = _bk_is(_bk_col, "cap") & ~_capex_m
+            _pers_m  = _bk_is(_bk_col, "pers")
+            _intl_m  = _bk_is(_bk_col, "intl", "internal", "transfer")
+            _noise_m = _bk_is(_bk_col, "noise")
+            _unk_m   = _bk_is(_bk_col, "unk")
+        else:
+            _rev_m = _cogs_m = _opex_m = _admin_m = _capex_m = _cap_m = \
+            _pers_m = _intl_m = _noise_m = _unk_m = pd.Series(False, index=ac_df.index)
+
+        # ── KPI Row ─────────────────────────────────────────────────────────────
+        k1, k2, k3, k4, k5 = st.columns(5)
+        if has_debit_credit:
             k1.metric("Total Credits",  f"₹{_total_cr:,.0f}")
             k2.metric("Total Debits",   f"₹{_total_dr:,.0f}")
-            k3.metric("Net (Cr − Dr)",  f"₹{_net:,.0f}", delta=f"₹{_net:,.0f}", delta_color="normal")
+            k3.metric("Net (Cr − Dr)",  f"₹{_net_flow:,.0f}",
+                      delta=f"₹{_net_flow:,.0f}", delta_color="normal")
             k4.metric("Transactions",   f"{len(ac_df):,}")
+            if _current_bal is not None:
+                k5.metric("Current Balance", f"₹{_current_bal:,.0f}")
         elif has_amount:
             _total_amt = pd.to_numeric(ac_df[ac_amount], errors="coerce").fillna(0).sum()
             k1.metric("Total Amount",  f"₹{_total_amt:,.0f}")
             k2.metric("Transactions",  f"{len(ac_df):,}")
-            if ac_balance:
-                _bal_vals = pd.to_numeric(ac_df[ac_balance], errors="coerce").dropna()
-                if not _bal_vals.empty:
-                    k3.metric("Latest Balance", f"₹{_bal_vals.iloc[-1]:,.0f}")
+            if _current_bal is not None:
+                k3.metric("Current Balance", f"₹{_current_bal:,.0f}")
         else:
             k1.metric("Transactions", f"{len(ac_df):,}")
 
         st.divider()
 
-        # --- Time-series charts ---
-        if ac_date and not ac_df[ac_date].isna().all():
-            _ts_c1, _ts_c2 = st.columns((3, 2))
+        # ── P&L Snapshot ────────────────────────────────────────────────────────
+        if ac_bucket and has_debit_credit:
+            st.subheader("📈 P&L Snapshot")
+            st.caption(
+                "Operational P&L built from your bucket classification. "
+                "Capital flows (CAP/CAPEX), internal transfers (INTL), personal (PERS), "
+                "and noise are excluded — they don't hit the P&L."
+            )
 
-            with _ts_c1:
-                if has_debit_credit:
-                    _daily_dr = ac_df.groupby(ac_df[ac_date].dt.date)[ac_debit].sum().reset_index()
-                    _daily_cr = ac_df.groupby(ac_df[ac_date].dt.date)[ac_credit].sum().reset_index()
-                    _daily_dr.columns = ["date", "Debit"]
-                    _daily_cr.columns = ["date", "Credit"]
-                    _daily_flow = _daily_dr.merge(_daily_cr, on="date", how="outer").fillna(0)
-                    _daily_m = _daily_flow.melt(id_vars="date", var_name="Type", value_name="Amount")
-                    fig_ac_ts = px.bar(
-                        _daily_m, x="date", y="Amount", color="Type", barmode="group",
-                        title="Daily Debits & Credits",
-                        color_discrete_map={"Debit": "#B85C5C", "Credit": PRIMARY},
-                    )
-                    fig_ac_ts.update_layout(xaxis_title="", yaxis_title="Amount (₹)", legend_title="")
-                    st.plotly_chart(fig_ac_ts, use_container_width=True)
-                elif has_amount:
-                    _daily_amt = ac_df.groupby(ac_df[ac_date].dt.date)[ac_amount].sum().reset_index()
-                    _daily_amt.columns = ["date", "amount"]
-                    fig_ac_ts = px.bar(
-                        _daily_amt, x="date", y="amount",
-                        title="Daily Transaction Amounts",
-                        color_discrete_sequence=[PRIMARY],
-                    )
-                    fig_ac_ts.update_layout(xaxis_title="", yaxis_title="Amount (₹)")
-                    st.plotly_chart(fig_ac_ts, use_container_width=True)
+            _revenue   = _ac_cr_s[_rev_m].sum()
+            _cogs      = _ac_dr_s[_cogs_m].sum()
+            _gross_p   = _revenue - _cogs
+            _gross_m   = _gross_p / _revenue * 100 if _revenue > 0 else 0.0
+            _opex_amt  = _ac_dr_s[_opex_m | _admin_m].sum()
+            _op_profit = _gross_p - _opex_amt
+            _op_margin = _op_profit / _revenue * 100 if _revenue > 0 else 0.0
 
-            with _ts_c2:
+            pl1, pl2, pl3, pl4, pl5, pl6, pl7 = st.columns(7)
+            pl1.metric("Revenue",        f"₹{_revenue:,.0f}")
+            pl2.metric("COGS",           f"₹{_cogs:,.0f}")
+            pl3.metric("Gross Profit",   f"₹{_gross_p:,.0f}",
+                       delta=f"₹{_gross_p:,.0f}", delta_color="normal")
+            pl4.metric("Gross Margin",   f"{_gross_m:.1f}%")
+            pl5.metric("OPEX + Admin",   f"₹{_opex_amt:,.0f}")
+            pl6.metric("Operating Profit", f"₹{_op_profit:,.0f}",
+                       delta=f"₹{_op_profit:,.0f}", delta_color="normal")
+            pl7.metric("Op. Margin",     f"{_op_margin:.1f}%")
+
+            # Waterfall chart: Revenue → Gross Profit → Operating Profit
+            _wf_labels = ["Revenue", "− COGS", "= Gross Profit", "− OPEX/Admin", "= Op. Profit"]
+            _wf_values = [_revenue, -_cogs, _gross_p, -_opex_amt, _op_profit]
+            _wf_types  = ["absolute", "relative", "total", "relative", "total"]
+            _wf_colors = [PRIMARY, "#B85C5C", "#5C9EBF", "#B85C5C",
+                          PRIMARY if _op_profit >= 0 else "#B85C5C"]
+
+            import plotly.graph_objects as go
+            fig_wf = go.Figure(go.Waterfall(
+                name="P&L", orientation="v",
+                measure=_wf_types,
+                x=_wf_labels,
+                y=_wf_values,
+                connector={"line": {"color": "rgba(0,0,0,0.2)"}},
+                decreasing={"marker": {"color": "#B85C5C"}},
+                increasing={"marker": {"color": PRIMARY}},
+                totals={"marker": {"color": "#5C9EBF"}},
+            ))
+            fig_wf.update_layout(
+                title="P&L Waterfall",
+                yaxis_title="Amount (₹)",
+                showlegend=False,
+                height=350,
+            )
+            st.plotly_chart(fig_wf, use_container_width=True)
+
+            # Monthly P&L trend
+            if ac_date and not ac_df[ac_date].isna().all():
+                _mo_pl = ac_df.copy()
+                _mo_pl["_month"] = _mo_pl[ac_date].dt.to_period("M").astype(str)
+                _mo_rev  = _mo_pl[_rev_m].groupby(_mo_pl["_month"])[ac_credit].sum()
+                _mo_cogs = _mo_pl[_cogs_m].groupby(_mo_pl["_month"])[ac_debit].sum()
+                _mo_opex = _mo_pl[_opex_m | _admin_m].groupby(_mo_pl["_month"])[ac_debit].sum()
+                _mo_pl_df = pd.DataFrame({
+                    "Revenue":          _mo_rev,
+                    "COGS":             _mo_cogs,
+                    "OPEX+Admin":       _mo_opex,
+                }).fillna(0)
+                _mo_pl_df["Gross Profit"]    = _mo_pl_df["Revenue"] - _mo_pl_df["COGS"]
+                _mo_pl_df["Operating Profit"] = _mo_pl_df["Gross Profit"] - _mo_pl_df["OPEX+Admin"]
+                _mo_pl_df = _mo_pl_df.reset_index().rename(columns={"_month": "Month"})
+
+                _mo_lines = _mo_pl_df.melt(
+                    id_vars="Month",
+                    value_vars=["Revenue", "Gross Profit", "Operating Profit"],
+                    var_name="Metric", value_name="Amount",
+                )
+                fig_mo_pl = px.line(
+                    _mo_lines, x="Month", y="Amount", color="Metric", markers=True,
+                    title="Monthly P&L Trend",
+                    color_discrete_map={
+                        "Revenue": PRIMARY,
+                        "Gross Profit": "#5C9EBF",
+                        "Operating Profit": ACCENT,
+                    },
+                )
+                fig_mo_pl.add_hline(y=0, line_dash="dash", line_color="gray")
+                fig_mo_pl.update_layout(xaxis_title="", yaxis_title="Amount (₹)", legend_title="")
+                st.plotly_chart(fig_mo_pl, use_container_width=True)
+
+                # Monthly P&L table
+                _mo_pl_display = _mo_pl_df.copy()
+                for _col in ["Revenue", "COGS", "OPEX+Admin", "Gross Profit", "Operating Profit"]:
+                    _mo_pl_display[_col] = _mo_pl_display[_col].apply(lambda x: f"₹{x:,.0f}")
+                st.dataframe(_mo_pl_display, use_container_width=True, hide_index=True)
+
+            st.divider()
+
+        # ── Cash Flow Analytics ─────────────────────────────────────────────────
+        if ac_date and has_debit_credit and not ac_df[ac_date].isna().all():
+            st.subheader("💸 Cash Flow Analytics")
+
+            # Daily net cash flow + rolling averages
+            _cf_daily = (
+                ac_df.groupby(ac_df[ac_date].dt.date)
+                .apply(lambda d: pd.to_numeric(d[ac_credit], errors="coerce").fillna(0).sum()
+                                 - pd.to_numeric(d[ac_debit], errors="coerce").fillna(0).sum())
+                .reset_index()
+            )
+            _cf_daily.columns = ["date", "net"]
+            _cf_daily["date"] = pd.to_datetime(_cf_daily["date"])
+            _cf_daily = _cf_daily.sort_values("date").reset_index(drop=True)
+            _cf_daily["7d avg"]  = _cf_daily["net"].rolling(7,  min_periods=1).mean()
+            _cf_daily["30d avg"] = _cf_daily["net"].rolling(30, min_periods=1).mean()
+
+            _cfa1, _cfa2 = st.columns((3, 2))
+            with _cfa1:
+                _cf_m = _cf_daily.melt(
+                    id_vars="date", value_vars=["7d avg", "30d avg"],
+                    var_name="Window", value_name="Avg Net",
+                )
+                fig_cf = px.bar(
+                    _cf_daily, x="date", y="net",
+                    title="Daily Net Cash Flow with Rolling Averages",
+                    color_discrete_sequence=["#D0D0D0"],
+                )
+                fig_cf.add_scatter(
+                    x=_cf_daily["date"], y=_cf_daily["7d avg"],
+                    mode="lines", name="7d avg", line=dict(color=ACCENT, width=2),
+                )
+                fig_cf.add_scatter(
+                    x=_cf_daily["date"], y=_cf_daily["30d avg"],
+                    mode="lines", name="30d avg", line=dict(color=PRIMARY, width=2),
+                )
+                fig_cf.add_hline(y=0, line_dash="dash", line_color="gray")
+                fig_cf.update_layout(xaxis_title="", yaxis_title="Net (₹)", legend_title="")
+                st.plotly_chart(fig_cf, use_container_width=True)
+
+            with _cfa2:
                 if ac_balance:
                     _bal_df = ac_df.dropna(subset=[ac_date]).copy()
                     _bal_df[ac_balance] = pd.to_numeric(_bal_df[ac_balance], errors="coerce")
                     _bal_df = _bal_df.dropna(subset=[ac_balance]).sort_values(ac_date)
                     if not _bal_df.empty:
-                        fig_bal = px.line(
+                        fig_bal = px.area(
                             _bal_df, x=ac_date, y=ac_balance,
-                            title="Balance Over Time",
-                            color_discrete_sequence=[ACCENT],
+                            title="Running Balance",
+                            color_discrete_sequence=[PRIMARY],
                         )
                         fig_bal.update_layout(xaxis_title="", yaxis_title="Balance (₹)")
                         st.plotly_chart(fig_bal, use_container_width=True)
 
-        # --- Bucket breakdown (high-level: REV / COGS / CAPEX / OPEX etc.) ---
+            # Burn rate & runway
+            if ac_bucket:
+                _monthly_rev_avg  = _ac_cr_s[_rev_m].sum()  / _ac_months
+                _monthly_cogs_avg = _ac_dr_s[_cogs_m].sum() / _ac_months
+                _monthly_opex_avg = _ac_dr_s[_opex_m | _admin_m].sum() / _ac_months
+                _monthly_burn     = _monthly_cogs_avg + _monthly_opex_avg
+
+                br1, br2, br3, br4 = st.columns(4)
+                br1.metric("Avg Monthly Revenue",  f"₹{_monthly_rev_avg:,.0f}")
+                br2.metric("Avg Monthly COGS",     f"₹{_monthly_cogs_avg:,.0f}")
+                br3.metric("Avg Monthly OPEX",     f"₹{_monthly_opex_avg:,.0f}")
+                _burn_label = f"₹{_monthly_burn:,.0f} / mo"
+                br4.metric("Operational Burn Rate", _burn_label)
+
+                if _current_bal is not None and _monthly_burn > 0:
+                    _runway = _current_bal / _monthly_burn
+                    st.info(
+                        f"At the current operational burn rate of **₹{_monthly_burn:,.0f}/month** "
+                        f"(COGS + OPEX + Admin), the current balance of **₹{_current_bal:,.0f}** "
+                        f"gives a runway of approximately **{_runway:.1f} months** — "
+                        f"assuming revenue drops to zero."
+                    )
+
+            st.divider()
+
+        # ── Daily transaction strip ─────────────────────────────────────────────
+        if ac_date and has_debit_credit and not ac_df[ac_date].isna().all():
+            _daily_dr = ac_df.groupby(ac_df[ac_date].dt.date)[ac_debit].sum().reset_index()
+            _daily_cr = ac_df.groupby(ac_df[ac_date].dt.date)[ac_credit].sum().reset_index()
+            _daily_dr.columns = ["date", "Debit"]
+            _daily_cr.columns = ["date", "Credit"]
+            _daily_flow = _daily_dr.merge(_daily_cr, on="date", how="outer").fillna(0)
+            _daily_m = _daily_flow.melt(id_vars="date", var_name="Type", value_name="Amount")
+            fig_ac_ts = px.bar(
+                _daily_m, x="date", y="Amount", color="Type", barmode="stack",
+                title="Daily Credits & Debits",
+                color_discrete_map={"Debit": "#B85C5C", "Credit": PRIMARY},
+            )
+            fig_ac_ts.update_layout(xaxis_title="", yaxis_title="Amount (₹)", legend_title="")
+            st.plotly_chart(fig_ac_ts, use_container_width=True)
+            st.divider()
+
+        # ── Bucket breakdown ────────────────────────────────────────────────────
         if ac_bucket and has_debit_credit:
             st.subheader("📂 Breakdown by Bucket")
-            _bk_cr = ac_df.groupby(ac_bucket)[ac_credit].sum().reset_index().rename(columns={ac_credit: "Credits"})
-            _bk_dr = ac_df.groupby(ac_bucket)[ac_debit].sum().reset_index().rename(columns={ac_debit: "Debits"})
+            _bk_cr  = ac_df.groupby(ac_bucket)[ac_credit].sum().reset_index().rename(columns={ac_credit: "Credits"})
+            _bk_dr  = ac_df.groupby(ac_bucket)[ac_debit].sum().reset_index().rename(columns={ac_debit: "Debits"})
             _bk_sum = _bk_cr.merge(_bk_dr, on=ac_bucket, how="outer").fillna(0)
             _bk_sum["Net"] = _bk_sum["Credits"] - _bk_sum["Debits"]
             _bk_sum = _bk_sum.sort_values("Net", ascending=False)
@@ -1329,9 +1518,9 @@ with tab_accounts:
             with _bb2:
                 fig_bk_net = px.bar(
                     _bk_sum, x=ac_bucket, y="Net",
-                    title="Net Flow by Bucket (Credits − Debits)",
+                    title="Net Flow by Bucket",
                     color="Net",
-                    color_continuous_scale=[[0, "#B85C5C"], [0.5, "#FAFAFA"], [1, PRIMARY]],
+                    color_continuous_scale=[[0, "#B85C5C"], [0.5, "#F0F0F0"], [1, PRIMARY]],
                 )
                 fig_bk_net.update_layout(xaxis_title="", yaxis_title="Net (₹)", coloraxis_showscale=False)
                 fig_bk_net.add_hline(y=0, line_dash="dash", line_color="gray")
@@ -1343,9 +1532,9 @@ with tab_accounts:
             st.dataframe(_bk_disp.rename(columns={ac_bucket: "Bucket"}), use_container_width=True, hide_index=True)
             st.divider()
 
-        # --- Category breakdown ---
+        # ── Category breakdown ──────────────────────────────────────────────────
         if ac_cat:
-            st.subheader("Breakdown by Category / Account")
+            st.subheader("🏷️ Breakdown by Category")
             _bc1, _bc2 = st.columns(2)
 
             if has_debit_credit:
@@ -1374,27 +1563,21 @@ with tab_accounts:
                     )
                     st.plotly_chart(fig_pie, use_container_width=True)
 
-                st.caption("**Net position by category (Credit − Debit):**")
-                _net_display = _cat_sum[[ac_cat, "Credit", "Debit", "Net"]].sort_values("Net", ascending=False)
-                _net_display["Net"] = _net_display["Net"].apply(lambda x: f"₹{x:,.0f}")
-                _net_display["Credit"] = _net_display["Credit"].apply(lambda x: f"₹{x:,.0f}")
-                _net_display["Debit"]  = _net_display["Debit"].apply(lambda x: f"₹{x:,.0f}")
-                st.dataframe(_net_display.rename(columns={ac_cat: "Category / Account"}), use_container_width=True, hide_index=True)
+                _net_display = _cat_sum[[ac_cat, "Credit", "Debit", "Net"]].sort_values("Net", ascending=False).copy()
+                for _col in ["Net", "Credit", "Debit"]:
+                    _net_display[_col] = _net_display[_col].apply(lambda x: f"₹{x:,.0f}")
+                st.dataframe(_net_display.rename(columns={ac_cat: "Category"}), use_container_width=True, hide_index=True)
 
             elif has_amount:
                 _cat_amt = ac_df.groupby(ac_cat)[ac_amount].sum().reset_index().sort_values(ac_amount, ascending=False)
                 _cat_amt.columns = ["Category", "Amount"]
-
                 with _bc1:
                     fig_cat = px.bar(
-                        _cat_amt.sort_values("Amount"),
-                        x="Amount", y="Category", orientation="h",
-                        title="Amount by Category",
-                        color_discrete_sequence=[PRIMARY],
+                        _cat_amt.sort_values("Amount"), x="Amount", y="Category", orientation="h",
+                        title="Amount by Category", color_discrete_sequence=[PRIMARY],
                     )
                     fig_cat.update_layout(xaxis_title="Amount (₹)", yaxis_title="")
                     st.plotly_chart(fig_cat, use_container_width=True)
-
                 with _bc2:
                     fig_pie = px.pie(
                         _cat_amt[_cat_amt["Amount"] > 0], names="Category", values="Amount",
@@ -1402,12 +1585,108 @@ with tab_accounts:
                         color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C", "#8CC99E", "#C8A28C"],
                     )
                     st.plotly_chart(fig_pie, use_container_width=True)
+            st.divider()
 
-        st.divider()
+        # ── Vendor / Contact Analysis ───────────────────────────────────────────
+        if ac_contact and has_debit_credit:
+            st.subheader("👥 Vendor & Contact Analysis")
+            _vc1, _vc2 = st.columns(2)
 
-        # --- Monthly summary ---
+            with _vc1:
+                _top_spend = (
+                    ac_df.groupby(ac_contact)[ac_debit].sum()
+                    .sort_values(ascending=False).head(15).reset_index()
+                )
+                _top_spend.columns = ["Contact", "Total Spent"]
+                _top_spend = _top_spend[_top_spend["Total Spent"] > 0]
+                fig_vs = px.bar(
+                    _top_spend.sort_values("Total Spent"),
+                    x="Total Spent", y="Contact", orientation="h",
+                    title="Top 15 Contacts by Total Spend (Debits)",
+                    color_discrete_sequence=["#B85C5C"],
+                )
+                fig_vs.update_layout(xaxis_title="Amount (₹)", yaxis_title="")
+                st.plotly_chart(fig_vs, use_container_width=True)
+
+            with _vc2:
+                _top_recv = (
+                    ac_df.groupby(ac_contact)[ac_credit].sum()
+                    .sort_values(ascending=False).head(15).reset_index()
+                )
+                _top_recv.columns = ["Contact", "Total Received"]
+                _top_recv = _top_recv[_top_recv["Total Received"] > 0]
+                fig_vr = px.bar(
+                    _top_recv.sort_values("Total Received"),
+                    x="Total Received", y="Contact", orientation="h",
+                    title="Top 15 Contacts by Credits Received",
+                    color_discrete_sequence=[PRIMARY],
+                )
+                fig_vr.update_layout(xaxis_title="Amount (₹)", yaxis_title="")
+                st.plotly_chart(fig_vr, use_container_width=True)
+
+            if ac_contact_type:
+                _ct_dr = ac_df.groupby(ac_contact_type)[ac_debit].sum().reset_index().rename(columns={ac_debit: "Debits"})
+                _ct_cr = ac_df.groupby(ac_contact_type)[ac_credit].sum().reset_index().rename(columns={ac_credit: "Credits"})
+                _ct_sum = _ct_dr.merge(_ct_cr, on=ac_contact_type, how="outer").fillna(0)
+                _ct_m = _ct_sum.melt(id_vars=ac_contact_type, value_vars=["Debits", "Credits"], var_name="Type", value_name="Amount")
+                fig_ct = px.bar(
+                    _ct_m, x=ac_contact_type, y="Amount", color="Type", barmode="group",
+                    title="Cash Flows by Contact Type",
+                    color_discrete_map={"Debits": "#B85C5C", "Credits": PRIMARY},
+                )
+                fig_ct.update_layout(xaxis_title="", yaxis_title="Amount (₹)", legend_title="")
+                st.plotly_chart(fig_ct, use_container_width=True)
+
+            st.divider()
+
+        # ── Alerts & Attention Items ────────────────────────────────────────────
+        _alerts = []
+        if ac_bucket:
+            _unk_df  = ac_df[_unk_m].copy()
+            _pers_df = ac_df[_pers_m].copy()
+            if not _unk_df.empty:
+                _alerts.append(("🔴 Unclassified (UNK) transactions", _unk_df,
+                                f"{len(_unk_df)} transactions worth "
+                                f"₹{pd.to_numeric(_unk_df[ac_debit], errors='coerce').fillna(0).sum():,.0f} in debits — "
+                                "categorise before GST filing."))
+            if not _pers_df.empty:
+                _pers_total = pd.to_numeric(_pers_df[ac_debit], errors="coerce").fillna(0).sum()
+                _alerts.append(("🟠 Personal (PERS) transactions", _pers_df,
+                                f"{len(_pers_df)} personal transactions totalling ₹{_pers_total:,.0f} in debits — "
+                                "ensure these are recorded as drawings / partner withdrawals, not business expenses."))
+
+        if ac_ready:
+            _not_ready = ac_df[ac_df[ac_ready].astype(str).str.strip().str.lower().ne("yes")].copy()
+            if not _not_ready.empty:
+                _alerts.append(("🟡 Not yet ready to import", _not_ready,
+                                f"{len(_not_ready)} transactions not marked 'Yes' in 'Ready to Import?' — review before Zoho import."))
+
+        if has_debit_credit:
+            _dr_nonzero = _ac_dr_s[_ac_dr_s > 0]
+            if len(_dr_nonzero) >= 4:
+                _outlier_thresh = _dr_nonzero.mean() + 2.5 * _dr_nonzero.std()
+                _large_df = ac_df[_ac_dr_s > _outlier_thresh].copy()
+                if not _large_df.empty:
+                    _alerts.append(("🔵 Large debit outliers (> 2.5σ)", _large_df,
+                                    f"{len(_large_df)} unusually large debits (above ₹{_outlier_thresh:,.0f}) — verify each is intentional."))
+
+        if _alerts:
+            st.subheader("⚠️ Alerts & Attention Items")
+            for _alert_title, _alert_df, _alert_msg in _alerts:
+                with st.expander(f"{_alert_title} ({len(_alert_df)})", expanded=True):
+                    st.caption(_alert_msg)
+                    _disp_alert = _alert_df.copy()
+                    if ac_date and ac_date in _disp_alert.columns:
+                        try:
+                            _disp_alert[ac_date] = _disp_alert[ac_date].dt.strftime("%d %b %Y")
+                        except Exception:
+                            pass
+                    st.dataframe(_disp_alert, use_container_width=True, hide_index=True)
+            st.divider()
+
+        # ── Monthly summary ─────────────────────────────────────────────────────
         if ac_date and not ac_df[ac_date].isna().all():
-            st.subheader("Monthly Summary")
+            st.subheader("📅 Monthly Summary")
             _mo_df = ac_df.copy()
             _mo_df["_month"] = _mo_df[ac_date].dt.to_period("M").astype(str)
 
@@ -1415,37 +1694,34 @@ with tab_accounts:
                 _mo_sum = (
                     _mo_df.groupby("_month")[[ac_debit, ac_credit]]
                     .sum().reset_index()
-                    .rename(columns={"_month": "Month", ac_debit: "Debit", ac_credit: "Credit"})
+                    .rename(columns={"_month": "Month", ac_debit: "Debits", ac_credit: "Credits"})
                 )
-                _mo_sum["Net"] = _mo_sum["Credit"] - _mo_sum["Debit"]
-                _mo_m = _mo_sum.melt(id_vars="Month", value_vars=["Debit", "Credit"], var_name="Type", value_name="Amount")
+                _mo_sum["Net"] = _mo_sum["Credits"] - _mo_sum["Debits"]
+                _mo_m = _mo_sum.melt(id_vars="Month", value_vars=["Debits", "Credits"], var_name="Type", value_name="Amount")
                 fig_mo = px.bar(
                     _mo_m, x="Month", y="Amount", color="Type", barmode="group",
-                    title="Monthly Debits & Credits",
-                    color_discrete_map={"Debit": "#B85C5C", "Credit": PRIMARY},
+                    title="Monthly Cash In vs Out",
+                    color_discrete_map={"Debits": "#B85C5C", "Credits": PRIMARY},
                 )
                 fig_mo.update_layout(xaxis_title="", yaxis_title="Amount (₹)", legend_title="")
                 st.plotly_chart(fig_mo, use_container_width=True)
 
                 _mo_display = _mo_sum.copy()
-                for _col in ["Credit", "Debit", "Net"]:
+                for _col in ["Credits", "Debits", "Net"]:
                     _mo_display[_col] = _mo_display[_col].apply(lambda x: f"₹{x:,.0f}")
                 st.dataframe(_mo_display, use_container_width=True, hide_index=True)
 
             elif has_amount:
-                _mo_sum = _mo_df.groupby("_month")[ac_amount].sum().reset_index()
-                _mo_sum.columns = ["Month", "Amount"]
-                fig_mo = px.bar(
-                    _mo_sum, x="Month", y="Amount",
-                    title="Monthly Total Amounts",
-                    color_discrete_sequence=[PRIMARY],
-                )
+                _mo_sum2 = _mo_df.groupby("_month")[ac_amount].sum().reset_index()
+                _mo_sum2.columns = ["Month", "Amount"]
+                fig_mo = px.bar(_mo_sum2, x="Month", y="Amount", title="Monthly Total Amounts",
+                                color_discrete_sequence=[PRIMARY])
                 fig_mo.update_layout(xaxis_title="", yaxis_title="Amount (₹)")
                 st.plotly_chart(fig_mo, use_container_width=True)
 
             st.divider()
 
-        # --- Full ledger table ---
+        # ── Full Ledger ─────────────────────────────────────────────────────────
         st.subheader("📋 Full Ledger")
         _disp = ac_df.copy()
         if ac_date and ac_date in _disp.columns:
@@ -1460,19 +1736,19 @@ with tab_accounts:
             hide_index=True,
         )
 
-        # Detected columns info
         with st.expander("ℹ️ Auto-detected column mapping", expanded=False):
             st.caption(
                 f"Date: `{ac_date or '—'}` | "
-                f"Withdrawal/Debit: `{ac_debit or '—'}` | "
-                f"Deposit/Credit: `{ac_credit or '—'}` | "
-                f"Amount: `{ac_amount or '—'}` | "
+                f"Debit: `{ac_debit or '—'}` | "
+                f"Credit: `{ac_credit or '—'}` | "
                 f"Balance: `{ac_balance or '—'}` | "
                 f"Bucket: `{ac_bucket or '—'}` | "
                 f"Category: `{ac_cat or '—'}` | "
+                f"Contact: `{ac_contact or '—'}` | "
                 f"Description: `{ac_desc or '—'}`\n\n"
-                "If a column is detected incorrectly, rename the column header in your Google Sheet to include "
-                "keywords like: `date`, `withdrawal`/`debit`, `deposit`/`credit`, `balance`, `bucket`, `category`, `narration`."
+                "Rename column headers in your Google Sheet to include the keywords "
+                "`date`, `withdrawal`/`debit`, `deposit`/`credit`, `balance`, `bucket`, "
+                "`category`, `contact n`, `narration` if detection is off."
             )
 
 # ============================================================
