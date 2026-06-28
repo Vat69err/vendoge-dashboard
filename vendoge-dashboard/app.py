@@ -713,6 +713,48 @@ with tab_refill:
         if "refill_qty" in rf.columns:
             _rf_qty = rf.groupby(rf["date"].dt.date)["refill_qty"].sum()
             snapshot_row("Daily Units Refilled", period_avgs(_rf_qty), fmt="{:,.0f}")
+        # Per-product refill breakdown: D, D-1, D-2 + rolling averages
+        if "product_name" in rf.columns:
+            st.caption("**Per-product refill breakdown**")
+            _rf_prod_rows = []
+            for _pname in sorted(rf["product_name"].dropna().unique()):
+                _prf = rf[rf["product_name"] == _pname]
+                _pa_qty = period_avgs(_prf.groupby(_prf["date"].dt.date)["refill_qty"].sum()) if "refill_qty" in _prf.columns else None
+                _pa_amt = period_avgs(_prf.groupby(_prf["date"].dt.date)["amount"].sum()) if "amount" in _prf.columns else None
+                if _pa_qty is None and _pa_amt is None:
+                    continue
+                _lbl_d  = _pa_qty["date_latest"].strftime("%-d %b") if (_pa_qty and _pa_qty["date_latest"]) else "Latest"
+                _lbl_m1 = (_pa_qty["date_m1"].strftime("%-d %b") + " (D−1)") if (_pa_qty and _pa_qty["date_m1"]) else "D−1"
+                _lbl_m2 = (_pa_qty["date_m2"].strftime("%-d %b") + " (D−2)") if (_pa_qty and _pa_qty["date_m2"]) else "D−2"
+                row = {"Product": _pname}
+                if _pa_qty:
+                    _dq = _pa_qty["latest"] - _pa_qty["day_m1"]
+                    _dq_pct = f"{'▲' if _dq >= 0 else '▼'} {abs(_dq / _pa_qty['day_m1'] * 100):.1f}%" if _pa_qty["day_m1"] else "—"
+                    row.update({
+                        f"{_lbl_d} qty":  f"{_pa_qty['latest']:,.0f}",
+                        f"{_lbl_m1} qty": f"{_pa_qty['day_m1']:,.0f}",
+                        f"{_lbl_m2} qty": f"{_pa_qty['day_m2']:,.0f}",
+                        "Δ qty": _dq_pct,
+                        "Avg 3d (qty)": f"{_pa_qty['avg_3d']:,.1f}",
+                        "Avg 7d (qty)": f"{_pa_qty['avg_7d']:,.1f}",
+                        "Overall/Day (qty)": f"{_pa_qty['avg_all']:,.1f}",
+                    })
+                if _pa_amt:
+                    _da = _pa_amt["latest"] - _pa_amt["day_m1"]
+                    _da_pct = f"{'▲' if _da >= 0 else '▼'} {abs(_da / _pa_amt['day_m1'] * 100):.1f}%" if _pa_amt["day_m1"] else "—"
+                    row.update({
+                        f"{_lbl_d} (₹)":  f"₹{_pa_amt['latest']:,.0f}",
+                        f"{_lbl_m1} (₹)": f"₹{_pa_amt['day_m1']:,.0f}",
+                        f"{_lbl_m2} (₹)": f"₹{_pa_amt['day_m2']:,.0f}",
+                        "Δ value": _da_pct,
+                        "Avg 3d (₹)": f"₹{_pa_amt['avg_3d']:,.0f}",
+                        "Avg 7d (₹)": f"₹{_pa_amt['avg_7d']:,.0f}",
+                        "Overall/Day (₹)": f"₹{_pa_amt['avg_all']:,.0f}",
+                    })
+                _rf_prod_rows.append(row)
+            if _rf_prod_rows:
+                st.dataframe(pd.DataFrame(_rf_prod_rows), use_container_width=True, hide_index=True)
+
         st.divider()
 
     by_refiller = rf.groupby("refiller_name")["amount"].sum().reset_index()
@@ -2382,6 +2424,10 @@ with tab_verka:
         snapshot_row("Verka — Daily Sales (₹)", period_avgs(vk_sales.groupby(vk_sales["date"].dt.date)["total_sales"].sum()))
     if not vk_sales.empty and "total_qty" in vk_sales.columns:
         snapshot_row("Verka — Daily Units Sold", period_avgs(vk_sales.groupby(vk_sales["date"].dt.date)["total_qty"].sum()), fmt="{:,.0f}")
+    if not vk_refill.empty and "refill_qty" in vk_refill.columns:
+        snapshot_row("Verka — Daily Units Refilled", period_avgs(vk_refill.groupby(vk_refill["date"].dt.date)["refill_qty"].sum()), fmt="{:,.0f}")
+    if not vk_refill.empty and "amount" in vk_refill.columns:
+        snapshot_row("Verka — Daily Refill Value (₹)", period_avgs(vk_refill.groupby(vk_refill["date"].dt.date)["amount"].sum()))
 
     st.divider()
 
@@ -2504,15 +2550,6 @@ with tab_verka:
         st.info("No refill data for Verka — check that brand_name is populated in the Refilling sheet.")
 
     if not vk_refill.empty and "refill_qty" in vk_refill.columns:
-        # Overall daily snapshot strips
-        _vk_ref_daily_qty = vk_refill.groupby(vk_refill["date"].dt.date)["refill_qty"].sum()
-        if not _vk_ref_daily_qty.empty:
-            snapshot_row("Verka — Daily Units Refilled", period_avgs(_vk_ref_daily_qty), fmt="{:,.0f}")
-        if "amount" in vk_refill.columns:
-            _vk_ref_daily_amt = vk_refill.groupby(vk_refill["date"].dt.date)["amount"].sum()
-            if not _vk_ref_daily_amt.empty:
-                snapshot_row("Verka — Daily Refill Value (₹)", period_avgs(_vk_ref_daily_amt))
-
         # Daywise refill chart
         st.subheader("📅 Verka Refills — Day-wise Trend")
         _vk_rf_daily = (
@@ -2603,6 +2640,100 @@ with tab_verka:
                                title="Units Refilled by Product (total period)", color_discrete_sequence=[PRIMARY])
             fig_vk_rf.update_layout(xaxis_title="Units Refilled", yaxis_title="")
             st.plotly_chart(fig_vk_rf, use_container_width=True)
+
+    # ── MESO: Sales / Refill ratio per product ─────────────────────────────────
+    st.divider()
+    st.subheader("⚖️ Verka — Sales / Refill Ratio (per product)")
+    st.info(
+        "**How to read this ratio** — Sales/Refill = units sold ÷ units refilled over the same window.\n\n"
+        "- **> 1**: Selling faster than refilling — stock is depleting. If sustained, schedule a refill soon.\n"
+        "- **≈ 1**: Balanced. Refills are keeping pace with demand.\n"
+        "- **< 1**: Refilling more than selling — stock is building up. Could signal slow sales or over-ordering.\n\n"
+        "Watch the **trend**: a rising ratio day-over-day means demand is outpacing restocking. "
+        "Compare 3d vs 7d vs all-time averages to spot whether the pattern is recent or long-standing."
+    )
+
+    if not vk_sales.empty and not vk_refill.empty and "product_name" in vk_sales.columns and "product_name" in vk_refill.columns:
+        _vk_sr_rows = []
+        _all_products = sorted(set(vk_sales["product_name"].dropna().unique()) | set(vk_refill["product_name"].dropna().unique()))
+
+        for _prod in _all_products:
+            _ps_daily = vk_sales[vk_sales["product_name"] == _prod].groupby(vk_sales["date"].dt.date)["total_qty"].sum() if "total_qty" in vk_sales.columns else pd.Series(dtype=float)
+            _pr_daily = vk_refill[vk_refill["product_name"] == _prod].groupby(vk_refill["date"].dt.date)["refill_qty"].sum() if "refill_qty" in vk_refill.columns else pd.Series(dtype=float)
+
+            def _ratio_for_window(s_series, r_series, days):
+                if s_series.empty and r_series.empty:
+                    return None
+                latest = max(
+                    (s_series.index.max() if not s_series.empty else pd.Timestamp.min.date()),
+                    (r_series.index.max() if not r_series.empty else pd.Timestamp.min.date()),
+                )
+                from datetime import date as _date
+                cutoff = latest - timedelta(days=days - 1)
+                s_sum = float(s_series[s_series.index >= cutoff].sum()) if not s_series.empty else 0.0
+                r_sum = float(r_series[r_series.index >= cutoff].sum()) if not r_series.empty else 0.0
+                return round(s_sum / r_sum, 2) if r_sum else None
+
+            _pa_s = period_avgs(_ps_daily) if not _ps_daily.empty else None
+            _pa_r = period_avgs(_pr_daily) if not _pr_daily.empty else None
+
+            def _day_ratio(s_avgs, r_avgs, key):
+                s = s_avgs[key] if s_avgs else 0.0
+                r = r_avgs[key] if r_avgs else 0.0
+                return round(s / r, 2) if r else None
+
+            _r_today = _day_ratio(_pa_s, _pa_r, "latest")
+            _r_m1    = _day_ratio(_pa_s, _pa_r, "day_m1")
+            _r_m2    = _day_ratio(_pa_s, _pa_r, "day_m2")
+            _r_3d    = _ratio_for_window(_ps_daily, _pr_daily, 3)
+            _r_7d    = _ratio_for_window(_ps_daily, _pr_daily, 7)
+            _r_15d   = _ratio_for_window(_ps_daily, _pr_daily, 15)
+            _r_all   = _ratio_for_window(_ps_daily, _pr_daily, 9999)
+
+            def _fmt_r(v):
+                return f"{v:.2f}x" if v is not None else "—"
+
+            def _trend(cur, prev):
+                if cur is None or prev is None:
+                    return "—"
+                d = cur - prev
+                return f"{'▲' if d >= 0 else '▼'} {abs(d / prev * 100):.1f}%" if prev else "—"
+
+            _lbl_d  = _pa_s["date_latest"].strftime("%-d %b") if (_pa_s and _pa_s["date_latest"]) else (_pa_r["date_latest"].strftime("%-d %b") if (_pa_r and _pa_r["date_latest"]) else "Today")
+            _lbl_m1 = (_pa_s["date_m1"].strftime("%-d %b") + " (D−1)") if (_pa_s and _pa_s["date_m1"]) else "D−1"
+            _lbl_m2 = (_pa_s["date_m2"].strftime("%-d %b") + " (D−2)") if (_pa_s and _pa_s["date_m2"]) else "D−2"
+
+            _vk_sr_rows.append({
+                "Product":    _prod,
+                _lbl_d:       _fmt_r(_r_today),
+                _lbl_m1:      _fmt_r(_r_m1),
+                _lbl_m2:      _fmt_r(_r_m2),
+                "Δ (D vs D−1)": _trend(_r_today, _r_m1),
+                "Ratio 3d":   _fmt_r(_r_3d),
+                "Ratio 7d":   _fmt_r(_r_7d),
+                "Ratio 15d":  _fmt_r(_r_15d),
+                "Ratio (all)": _fmt_r(_r_all),
+            })
+
+        if _vk_sr_rows:
+            st.dataframe(pd.DataFrame(_vk_sr_rows), use_container_width=True, hide_index=True)
+
+            # Bar chart: all-time ratio per product
+            _sr_chart = pd.DataFrame([
+                {"Product": r["Product"], "Sales/Refill": float(r["Ratio (all)"].rstrip("x")) if r["Ratio (all)"] != "—" else None}
+                for r in _vk_sr_rows
+            ]).dropna()
+            if not _sr_chart.empty:
+                fig_sr = px.bar(
+                    _sr_chart.sort_values("Sales/Refill"),
+                    x="Sales/Refill", y="Product", orientation="h",
+                    title="Sales / Refill Ratio by Product (all-time)",
+                    color_discrete_sequence=[PRIMARY],
+                )
+                fig_sr.add_vline(x=1.0, line_dash="dash", line_color="red",
+                                 annotation_text="Balanced (1x)", annotation_position="top right")
+                fig_sr.update_layout(xaxis_title="Ratio (>1 = selling faster than refilling)", yaxis_title="")
+                st.plotly_chart(fig_sr, use_container_width=True)
 
     st.divider()
 
