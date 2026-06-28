@@ -31,18 +31,19 @@ st.set_page_config(
 # 1. CONFIG — loaded from Streamlit secrets
 # ============================================================
 try:
-    SHEET_ID = st.secrets["sheet_id"]
+    SHEET_ID          = st.secrets["sheets"]["dashboard"]
+    ACCOUNTS_SHEET_ID = st.secrets["sheets"]["accounts"]
     GIDS = {
-        "sales": str(st.secrets["gids"]["sales"]),
-        "refill": str(st.secrets["gids"]["refill"]),
-        "stockout": str(st.secrets["gids"]["stockout"]),
-        "stock_in": str(st.secrets["gids"].get("stock_in", "")),
-        "inventory": str(st.secrets["gids"].get("inventory", "")),
-        "accounts": str(st.secrets["gids"].get("accounts", "")),
+        "sales":     str(st.secrets["gids"]["dashboard"]["sales"]),
+        "refill":    str(st.secrets["gids"]["dashboard"]["refill"]),
+        "stockout":  str(st.secrets["gids"]["dashboard"]["stockout"]),
+        "stock_in":  str(st.secrets["gids"]["dashboard"].get("stock_in", "")),
+        "inventory": str(st.secrets["gids"]["dashboard"].get("inventory", "")),
+        "accounts":  str(st.secrets["gids"]["accounts"].get("accounts", "")),
     }
 except (KeyError, FileNotFoundError):
     st.error(
-        "Missing secrets! This app needs `sheet_id` and `gids` set up in "
+        "Missing secrets! This app needs `[sheets]` and `[gids.dashboard]` set up in "
         "Streamlit secrets — locally in `.streamlit/secrets.toml`, or on "
         "Streamlit Cloud under your app's Settings > Secrets."
     )
@@ -53,10 +54,11 @@ except (KeyError, FileNotFoundError):
 # ============================================================
 
 
-def _sheet_url(gid: str) -> str:
+def _sheet_url(gid: str, sheet_id: str = None) -> str:
     """Build the raw CSV export URL for one tab of a PUBLIC google sheet, by gid."""
+    sid = sheet_id or SHEET_ID
     return (
-        f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export"
+        f"https://docs.google.com/spreadsheets/d/{sid}/export"
         f"?format=csv&gid={gid}"
     )
 
@@ -95,7 +97,7 @@ def load_data():
 
     accounts = pd.DataFrame()
     if GIDS.get("accounts"):
-        accounts = pd.read_csv(_sheet_url(GIDS["accounts"]))
+        accounts = pd.read_csv(_sheet_url(GIDS["accounts"], sheet_id=ACCOUNTS_SHEET_ID))
         # Auto-detect and parse date column (dayfirst handles DD/MM/YY bank-export format)
         _ac_date_col = next((c for c in accounts.columns if "date" in c.lower()), None)
         if _ac_date_col:
