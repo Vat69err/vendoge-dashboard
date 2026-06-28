@@ -2317,7 +2317,7 @@ with tab_verka:
 
     # Keywords that identify Verka products even when brand_name is missing/wrong.
     # Edit this list in the sidebar expander to capture untagged products.
-    _VERKA_DEFAULT_KEYWORDS = ["verka", "varka", "milkfed"]
+    _VERKA_DEFAULT_KEYWORDS = ["verka", "varka", "milkfed", "sweet lassi", "namkeen lassi", "lassi"]
 
     with st.sidebar.expander("🥛 Verka keyword mapping", expanded=False):
         st.caption("Products whose name contains any of these keywords are treated as Verka, even if brand_name is blank or mismatched.")
@@ -2512,6 +2512,38 @@ with tab_verka:
             _vk_ref_daily_amt = vk_refill.groupby(vk_refill["date"].dt.date)["amount"].sum()
             if not _vk_ref_daily_amt.empty:
                 snapshot_row("Verka — Daily Refill Value (₹)", period_avgs(_vk_ref_daily_amt))
+
+        # Daywise refill chart
+        st.subheader("📅 Verka Refills — Day-wise Trend")
+        _vk_rf_daily = (
+            vk_refill.groupby([vk_refill["date"].dt.date, "product_name"])["refill_qty"]
+            .sum().reset_index()
+        )
+        _vk_rf_daily.columns = ["date", "product_name", "refill_qty"]
+        if not _vk_rf_daily.empty:
+            _vk_rf_dc1, _vk_rf_dc2 = st.columns(2)
+            with _vk_rf_dc1:
+                fig_vk_rf_daily = px.bar(
+                    _vk_rf_daily, x="date", y="refill_qty", color="product_name",
+                    title="Daily Refill Units (by Product)", barmode="stack",
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                fig_vk_rf_daily.update_layout(xaxis_title="", yaxis_title="Units Refilled", legend_title="Product")
+                st.plotly_chart(fig_vk_rf_daily, use_container_width=True)
+            with _vk_rf_dc2:
+                if "amount" in vk_refill.columns:
+                    _vk_rf_daily_val = (
+                        vk_refill.groupby([vk_refill["date"].dt.date, "product_name"])["amount"]
+                        .sum().reset_index()
+                    )
+                    _vk_rf_daily_val.columns = ["date", "product_name", "amount"]
+                    fig_vk_rf_val = px.bar(
+                        _vk_rf_daily_val, x="date", y="amount", color="product_name",
+                        title="Daily Refill Value ₹ (by Product)", barmode="stack",
+                        color_discrete_sequence=px.colors.qualitative.Set2,
+                    )
+                    fig_vk_rf_val.update_layout(xaxis_title="", yaxis_title="Value (₹)", legend_title="Product")
+                    st.plotly_chart(fig_vk_rf_val, use_container_width=True)
 
         st.divider()
 
