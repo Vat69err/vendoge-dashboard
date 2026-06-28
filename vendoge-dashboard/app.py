@@ -1206,6 +1206,9 @@ with tab_accounts:
         has_debit_credit = bool(ac_debit and ac_credit)
         has_amount       = bool(ac_amount)
 
+        _AC_CHART_H = 420
+        _AC_MONEY_AXIS = dict(tickformat=",.0f", tickprefix="₹")
+
         # ── Date filter ─────────────────────────────────────────────────────────
         if ac_date and not accounts_df[ac_date].isna().all():
             ac_min = accounts_df[ac_date].dropna().min()
@@ -1345,16 +1348,19 @@ with tab_accounts:
                 measure=_wf_types,
                 x=_wf_labels,
                 y=_wf_values,
+                texttemplate="₹%{value:,.0f}",
+                textposition="outside",
                 connector={"line": {"color": "rgba(0,0,0,0.2)"}},
                 decreasing={"marker": {"color": "#B85C5C"}},
                 increasing={"marker": {"color": PRIMARY}},
                 totals={"marker": {"color": "#5C9EBF"}},
             ))
             fig_wf.update_layout(
-                title="P&L Waterfall",
-                yaxis_title="Amount (₹)",
+                title=dict(text="P&L Waterfall", font=dict(size=16)),
+                yaxis=dict(title="Amount", tickformat=",.0f", tickprefix="₹"),
                 showlegend=False,
-                height=350,
+                height=_AC_CHART_H,
+                template="plotly_white",
             )
             st.plotly_chart(fig_wf, use_container_width=True)
 
@@ -1387,15 +1393,25 @@ with tab_accounts:
                         "Gross Profit": "#5C9EBF",
                         "Operating Profit": ACCENT,
                     },
+                    template="plotly_white",
                 )
                 fig_mo_pl.add_hline(y=0, line_dash="dash", line_color="gray")
-                fig_mo_pl.update_layout(xaxis_title="", yaxis_title="Amount (₹)", legend_title="")
+                fig_mo_pl.update_layout(
+                    title=dict(font=dict(size=16)),
+                    xaxis_title="",
+                    yaxis=dict(title="Amount", **_AC_MONEY_AXIS),
+                    legend_title="",
+                    height=_AC_CHART_H,
+                )
                 st.plotly_chart(fig_mo_pl, use_container_width=True)
 
-                # Monthly P&L table
+                # Monthly P&L table with margins
                 _mo_pl_display = _mo_pl_df.copy()
+                _mo_pl_display["GP %"] = (_mo_pl_df["Gross Profit"] / _mo_pl_df["Revenue"].replace(0, float("nan")) * 100).map("{:.1f}%".format)
+                _mo_pl_display["Op %"] = (_mo_pl_df["Operating Profit"] / _mo_pl_df["Revenue"].replace(0, float("nan")) * 100).map("{:.1f}%".format)
                 for _col in ["Revenue", "COGS", "OPEX+Admin", "Gross Profit", "Operating Profit"]:
-                    _mo_pl_display[_col] = _mo_pl_display[_col].apply(lambda x: f"₹{x:,.0f}")
+                    _mo_pl_display[_col] = _mo_pl_df[_col].apply(lambda x: f"₹{x:,.0f}")
+                _mo_pl_display = _mo_pl_display[["Month", "Revenue", "COGS", "Gross Profit", "GP %", "OPEX+Admin", "Operating Profit", "Op %"]]
                 st.dataframe(_mo_pl_display, use_container_width=True, hide_index=True)
 
             st.divider()
@@ -1419,14 +1435,11 @@ with tab_accounts:
 
             _cfa1, _cfa2 = st.columns((3, 2))
             with _cfa1:
-                _cf_m = _cf_daily.melt(
-                    id_vars="date", value_vars=["7d avg", "30d avg"],
-                    var_name="Window", value_name="Avg Net",
-                )
                 fig_cf = px.bar(
                     _cf_daily, x="date", y="net",
-                    title="Daily Net Cash Flow with Rolling Averages",
-                    color_discrete_sequence=["#D0D0D0"],
+                    title="Daily Net Cash Flow",
+                    color_discrete_sequence=["#B0B8C1"],
+                    template="plotly_white",
                 )
                 fig_cf.add_scatter(
                     x=_cf_daily["date"], y=_cf_daily["7d avg"],
@@ -1434,10 +1447,16 @@ with tab_accounts:
                 )
                 fig_cf.add_scatter(
                     x=_cf_daily["date"], y=_cf_daily["30d avg"],
-                    mode="lines", name="30d avg", line=dict(color=PRIMARY, width=2),
+                    mode="lines", name="30d avg", line=dict(color=PRIMARY, width=2.5),
                 )
                 fig_cf.add_hline(y=0, line_dash="dash", line_color="gray")
-                fig_cf.update_layout(xaxis_title="", yaxis_title="Net (₹)", legend_title="")
+                fig_cf.update_layout(
+                    title=dict(font=dict(size=16)),
+                    xaxis_title="",
+                    yaxis=dict(title="Net Flow", **_AC_MONEY_AXIS),
+                    legend_title="",
+                    height=_AC_CHART_H,
+                )
                 st.plotly_chart(fig_cf, use_container_width=True)
 
             with _cfa2:
@@ -1450,8 +1469,14 @@ with tab_accounts:
                             _bal_df, x=ac_date, y=ac_balance,
                             title="Running Balance",
                             color_discrete_sequence=[PRIMARY],
+                            template="plotly_white",
                         )
-                        fig_bal.update_layout(xaxis_title="", yaxis_title="Balance (₹)")
+                        fig_bal.update_layout(
+                            title=dict(font=dict(size=16)),
+                            xaxis_title="",
+                            yaxis=dict(title="Balance", **_AC_MONEY_AXIS),
+                            height=_AC_CHART_H,
+                        )
                         st.plotly_chart(fig_bal, use_container_width=True)
 
             # Burn rate & runway
@@ -1465,8 +1490,7 @@ with tab_accounts:
                 br1.metric("Avg Monthly Revenue",  f"₹{_monthly_rev_avg:,.0f}")
                 br2.metric("Avg Monthly COGS",     f"₹{_monthly_cogs_avg:,.0f}")
                 br3.metric("Avg Monthly OPEX",     f"₹{_monthly_opex_avg:,.0f}")
-                _burn_label = f"₹{_monthly_burn:,.0f} / mo"
-                br4.metric("Operational Burn Rate", _burn_label)
+                br4.metric("Operational Burn Rate", f"₹{_monthly_burn:,.0f} / mo")
 
                 if _current_bal is not None and _monthly_burn > 0:
                     _runway = _current_bal / _monthly_burn
@@ -1491,8 +1515,15 @@ with tab_accounts:
                 _daily_m, x="date", y="Amount", color="Type", barmode="stack",
                 title="Daily Credits & Debits",
                 color_discrete_map={"Debit": "#B85C5C", "Credit": PRIMARY},
+                template="plotly_white",
             )
-            fig_ac_ts.update_layout(xaxis_title="", yaxis_title="Amount (₹)", legend_title="")
+            fig_ac_ts.update_layout(
+                title=dict(font=dict(size=16)),
+                xaxis_title="",
+                yaxis=dict(title="Amount", **_AC_MONEY_AXIS),
+                legend_title="",
+                height=_AC_CHART_H,
+            )
             st.plotly_chart(fig_ac_ts, use_container_width=True)
             st.divider()
 
@@ -1512,17 +1543,29 @@ with tab_accounts:
                     _bk_m, x=ac_bucket, y="Amount", color="Type", barmode="group",
                     title="Credits & Debits by Bucket",
                     color_discrete_map={"Debits": "#B85C5C", "Credits": PRIMARY},
+                    template="plotly_white",
                 )
-                fig_bk.update_layout(xaxis_title="", yaxis_title="Amount (₹)", legend_title="")
+                fig_bk.update_layout(
+                    xaxis_title="",
+                    yaxis=dict(title="Amount", **_AC_MONEY_AXIS),
+                    legend_title="",
+                    height=_AC_CHART_H,
+                )
                 st.plotly_chart(fig_bk, use_container_width=True)
             with _bb2:
                 fig_bk_net = px.bar(
                     _bk_sum, x=ac_bucket, y="Net",
                     title="Net Flow by Bucket",
                     color="Net",
-                    color_continuous_scale=[[0, "#B85C5C"], [0.5, "#F0F0F0"], [1, PRIMARY]],
+                    color_continuous_scale=[[0, "#B85C5C"], [0.5, "#E8E8E8"], [1, PRIMARY]],
+                    template="plotly_white",
                 )
-                fig_bk_net.update_layout(xaxis_title="", yaxis_title="Net (₹)", coloraxis_showscale=False)
+                fig_bk_net.update_layout(
+                    xaxis_title="",
+                    yaxis=dict(title="Net", **_AC_MONEY_AXIS),
+                    coloraxis_showscale=False,
+                    height=_AC_CHART_H,
+                )
                 fig_bk_net.add_hline(y=0, line_dash="dash", line_color="gray")
                 st.plotly_chart(fig_bk_net, use_container_width=True)
 
@@ -1545,22 +1588,27 @@ with tab_accounts:
 
                 with _bc1:
                     _cat_m = _cat_sum.melt(id_vars=ac_cat, value_vars=["Debit", "Credit"], var_name="Type", value_name="Amount")
+                    _n_cats = _cat_sum[ac_cat].nunique()
                     fig_cat = px.bar(
                         _cat_m.sort_values("Amount"),
                         x="Amount", y=ac_cat, color="Type", orientation="h", barmode="group",
                         title="Debits & Credits by Category",
                         color_discrete_map={"Debit": "#B85C5C", "Credit": PRIMARY},
+                        template="plotly_white",
+                        height=max(_AC_CHART_H, _n_cats * 28 + 120),
                     )
-                    fig_cat.update_layout(xaxis_title="Amount (₹)", yaxis_title="")
+                    fig_cat.update_layout(xaxis=dict(title="Amount", **_AC_MONEY_AXIS), yaxis_title="")
                     st.plotly_chart(fig_cat, use_container_width=True)
 
                 with _bc2:
                     _pie_col = "Credit" if _cat_sum["Credit"].sum() > 0 else "Debit"
                     fig_pie = px.pie(
                         _cat_sum[_cat_sum[_pie_col] > 0], names=ac_cat, values=_pie_col,
-                        hole=0.5, title=f"{_pie_col} Share by Category",
+                        hole=0.45, title=f"{_pie_col} Share by Category",
                         color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C", "#8CC99E", "#C8A28C"],
                     )
+                    fig_pie.update_traces(textinfo="label+percent", textfont_size=12)
+                    fig_pie.update_layout(height=_AC_CHART_H, showlegend=False)
                     st.plotly_chart(fig_pie, use_container_width=True)
 
                 _net_display = _cat_sum[[ac_cat, "Credit", "Debit", "Net"]].sort_values("Net", ascending=False).copy()
@@ -1575,15 +1623,18 @@ with tab_accounts:
                     fig_cat = px.bar(
                         _cat_amt.sort_values("Amount"), x="Amount", y="Category", orientation="h",
                         title="Amount by Category", color_discrete_sequence=[PRIMARY],
+                        template="plotly_white",
                     )
-                    fig_cat.update_layout(xaxis_title="Amount (₹)", yaxis_title="")
+                    fig_cat.update_layout(xaxis=dict(title="Amount", **_AC_MONEY_AXIS), yaxis_title="", height=_AC_CHART_H)
                     st.plotly_chart(fig_cat, use_container_width=True)
                 with _bc2:
                     fig_pie = px.pie(
                         _cat_amt[_cat_amt["Amount"] > 0], names="Category", values="Amount",
-                        hole=0.5, title="Amount Share by Category",
+                        hole=0.45, title="Amount Share by Category",
                         color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C", "#8CC99E", "#C8A28C"],
                     )
+                    fig_pie.update_traces(textinfo="label+percent", textfont_size=12)
+                    fig_pie.update_layout(height=_AC_CHART_H, showlegend=False)
                     st.plotly_chart(fig_pie, use_container_width=True)
             st.divider()
 
@@ -1602,10 +1653,15 @@ with tab_accounts:
                 fig_vs = px.bar(
                     _top_spend.sort_values("Total Spent"),
                     x="Total Spent", y="Contact", orientation="h",
-                    title="Top 15 Contacts by Total Spend (Debits)",
+                    title="Top 15 by Total Spend (Debits)",
                     color_discrete_sequence=["#B85C5C"],
+                    template="plotly_white",
                 )
-                fig_vs.update_layout(xaxis_title="Amount (₹)", yaxis_title="")
+                fig_vs.update_layout(
+                    xaxis=dict(title="Amount", **_AC_MONEY_AXIS),
+                    yaxis_title="",
+                    height=max(_AC_CHART_H, len(_top_spend) * 26 + 120),
+                )
                 st.plotly_chart(fig_vs, use_container_width=True)
 
             with _vc2:
@@ -1618,10 +1674,15 @@ with tab_accounts:
                 fig_vr = px.bar(
                     _top_recv.sort_values("Total Received"),
                     x="Total Received", y="Contact", orientation="h",
-                    title="Top 15 Contacts by Credits Received",
+                    title="Top 15 by Credits Received",
                     color_discrete_sequence=[PRIMARY],
+                    template="plotly_white",
                 )
-                fig_vr.update_layout(xaxis_title="Amount (₹)", yaxis_title="")
+                fig_vr.update_layout(
+                    xaxis=dict(title="Amount", **_AC_MONEY_AXIS),
+                    yaxis_title="",
+                    height=max(_AC_CHART_H, len(_top_recv) * 26 + 120),
+                )
                 st.plotly_chart(fig_vr, use_container_width=True)
 
             if ac_contact_type:
@@ -1633,8 +1694,14 @@ with tab_accounts:
                     _ct_m, x=ac_contact_type, y="Amount", color="Type", barmode="group",
                     title="Cash Flows by Contact Type",
                     color_discrete_map={"Debits": "#B85C5C", "Credits": PRIMARY},
+                    template="plotly_white",
                 )
-                fig_ct.update_layout(xaxis_title="", yaxis_title="Amount (₹)", legend_title="")
+                fig_ct.update_layout(
+                    xaxis_title="",
+                    yaxis=dict(title="Amount", **_AC_MONEY_AXIS),
+                    legend_title="",
+                    height=_AC_CHART_H,
+                )
                 st.plotly_chart(fig_ct, use_container_width=True)
 
             st.divider()
@@ -1684,9 +1751,9 @@ with tab_accounts:
                     st.dataframe(_disp_alert, use_container_width=True, hide_index=True)
             st.divider()
 
-        # ── Monthly summary ─────────────────────────────────────────────────────
+        # ── Monthly Breakdown ────────────────────────────────────────────────────
         if ac_date and not ac_df[ac_date].isna().all():
-            st.subheader("📅 Monthly Summary")
+            st.subheader("📅 Monthly Breakdown")
             _mo_df = ac_df.copy()
             _mo_df["_month"] = _mo_df[ac_date].dt.to_period("M").astype(str)
 
@@ -1696,30 +1763,115 @@ with tab_accounts:
                     .sum().reset_index()
                     .rename(columns={"_month": "Month", ac_debit: "Debits", ac_credit: "Credits"})
                 )
-                _mo_sum["Net"] = _mo_sum["Credits"] - _mo_sum["Debits"]
-                _mo_m = _mo_sum.melt(id_vars="Month", value_vars=["Debits", "Credits"], var_name="Type", value_name="Amount")
+                _mo_sum["Net"]  = _mo_sum["Credits"] - _mo_sum["Debits"]
+                _mo_sum["Txns"] = _mo_df.groupby("_month").size().values
+
+                _mo_bar_m = _mo_sum.melt(id_vars="Month", value_vars=["Debits", "Credits"], var_name="Type", value_name="Amount")
                 fig_mo = px.bar(
-                    _mo_m, x="Month", y="Amount", color="Type", barmode="group",
+                    _mo_bar_m, x="Month", y="Amount", color="Type", barmode="group",
                     title="Monthly Cash In vs Out",
                     color_discrete_map={"Debits": "#B85C5C", "Credits": PRIMARY},
+                    template="plotly_white",
                 )
-                fig_mo.update_layout(xaxis_title="", yaxis_title="Amount (₹)", legend_title="")
+                fig_mo.update_layout(
+                    title=dict(font=dict(size=16)),
+                    xaxis_title="",
+                    yaxis=dict(title="Amount", **_AC_MONEY_AXIS),
+                    legend_title="",
+                    height=_AC_CHART_H,
+                )
                 st.plotly_chart(fig_mo, use_container_width=True)
 
-                _mo_display = _mo_sum.copy()
-                for _col in ["Credits", "Debits", "Net"]:
-                    _mo_display[_col] = _mo_display[_col].apply(lambda x: f"₹{x:,.0f}")
-                st.dataframe(_mo_display, use_container_width=True, hide_index=True)
+                fig_mo_net = px.line(
+                    _mo_sum, x="Month", y="Net", markers=True,
+                    title="Monthly Net Flow",
+                    color_discrete_sequence=[PRIMARY],
+                    template="plotly_white",
+                )
+                fig_mo_net.add_hline(y=0, line_dash="dash", line_color="gray")
+                fig_mo_net.update_layout(
+                    xaxis_title="", yaxis=dict(title="Net", **_AC_MONEY_AXIS), height=300,
+                )
+                st.plotly_chart(fig_mo_net, use_container_width=True)
+
+                if ac_bucket:
+                    _mo_rev_s  = _mo_df[_rev_m].groupby(_mo_df["_month"])[ac_credit].sum()
+                    _mo_cogs_s = _mo_df[_cogs_m].groupby(_mo_df["_month"])[ac_debit].sum()
+                    _mo_opex_s = _mo_df[_opex_m | _admin_m].groupby(_mo_df["_month"])[ac_debit].sum()
+                    _mo_full   = _mo_sum.copy().set_index("Month")
+                    _mo_full["Revenue"]      = _mo_rev_s.reindex(_mo_full.index).fillna(0)
+                    _mo_full["COGS"]         = _mo_cogs_s.reindex(_mo_full.index).fillna(0)
+                    _mo_full["Gross Profit"] = _mo_full["Revenue"] - _mo_full["COGS"]
+                    _mo_full["OPEX"]         = _mo_opex_s.reindex(_mo_full.index).fillna(0)
+                    _mo_full["Op Profit"]    = _mo_full["Gross Profit"] - _mo_full["OPEX"]
+                    _mo_full = _mo_full.reset_index()
+                    _mo_tbl  = _mo_full.copy()
+                    _mo_tbl["GP %"] = (_mo_full["Gross Profit"] / _mo_full["Revenue"].replace(0, float("nan")) * 100).map("{:.1f}%".format)
+                    _mo_tbl["Op %"] = (_mo_full["Op Profit"] / _mo_full["Revenue"].replace(0, float("nan")) * 100).map("{:.1f}%".format)
+                    for _c in ["Revenue", "COGS", "Gross Profit", "OPEX", "Op Profit", "Credits", "Debits", "Net"]:
+                        _mo_tbl[_c] = _mo_full[_c].apply(lambda x: f"₹{x:,.0f}")
+                    _mo_tbl = _mo_tbl[["Month", "Revenue", "COGS", "Gross Profit", "GP %", "OPEX", "Op Profit", "Op %", "Credits", "Debits", "Net", "Txns"]]
+                else:
+                    _mo_tbl = _mo_sum.copy()
+                    for _c in ["Credits", "Debits", "Net"]:
+                        _mo_tbl[_c] = _mo_sum[_c].apply(lambda x: f"₹{x:,.0f}")
+                st.dataframe(_mo_tbl, use_container_width=True, hide_index=True)
 
             elif has_amount:
                 _mo_sum2 = _mo_df.groupby("_month")[ac_amount].sum().reset_index()
                 _mo_sum2.columns = ["Month", "Amount"]
                 fig_mo = px.bar(_mo_sum2, x="Month", y="Amount", title="Monthly Total Amounts",
-                                color_discrete_sequence=[PRIMARY])
-                fig_mo.update_layout(xaxis_title="", yaxis_title="Amount (₹)")
+                                color_discrete_sequence=[PRIMARY], template="plotly_white")
+                fig_mo.update_layout(xaxis_title="", yaxis=dict(title="Amount", **_AC_MONEY_AXIS), height=_AC_CHART_H)
                 st.plotly_chart(fig_mo, use_container_width=True)
 
             st.divider()
+
+        # ── Latest Day Breakdown ─────────────────────────────────────────────────
+        if ac_date and has_debit_credit and not ac_df[ac_date].isna().all():
+            _latest_date = ac_df[ac_date].dropna().dt.date.max()
+            _latest_df   = ac_df[ac_df[ac_date].dt.date == _latest_date].copy()
+
+            if not _latest_df.empty:
+                _ld_label = _latest_date.strftime("%d %b %Y")
+                st.subheader(f"📆 Latest Day — {_ld_label}")
+
+                _ld_cr  = pd.to_numeric(_latest_df[ac_credit], errors="coerce").fillna(0).sum()
+                _ld_dr  = pd.to_numeric(_latest_df[ac_debit],  errors="coerce").fillna(0).sum()
+                _ld_net = _ld_cr - _ld_dr
+
+                ld1, ld2, ld3, ld4 = st.columns(4)
+                ld1.metric("Credits",      f"₹{_ld_cr:,.0f}")
+                ld2.metric("Debits",       f"₹{_ld_dr:,.0f}")
+                ld3.metric("Net",          f"₹{_ld_net:,.0f}", delta=f"₹{_ld_net:,.0f}", delta_color="normal")
+                ld4.metric("Transactions", f"{len(_latest_df):,}")
+
+                if ac_bucket:
+                    _ld_bk_cr = _latest_df.groupby(ac_bucket)[ac_credit].sum().reset_index().rename(columns={ac_credit: "Credits"})
+                    _ld_bk_dr = _latest_df.groupby(ac_bucket)[ac_debit].sum().reset_index().rename(columns={ac_debit: "Debits"})
+                    _ld_bk    = _ld_bk_cr.merge(_ld_bk_dr, on=ac_bucket, how="outer").fillna(0)
+                    _ld_bk["Net"] = _ld_bk["Credits"] - _ld_bk["Debits"]
+                    _ld_bk_m  = _ld_bk.melt(id_vars=ac_bucket, value_vars=["Credits", "Debits"], var_name="Type", value_name="Amount")
+                    fig_ld_bk = px.bar(
+                        _ld_bk_m, x=ac_bucket, y="Amount", color="Type", barmode="group",
+                        title=f"Bucket Breakdown — {_ld_label}",
+                        color_discrete_map={"Debits": "#B85C5C", "Credits": PRIMARY},
+                        template="plotly_white",
+                    )
+                    fig_ld_bk.update_layout(
+                        xaxis_title="", yaxis=dict(title="Amount", **_AC_MONEY_AXIS),
+                        legend_title="", height=340,
+                    )
+                    st.plotly_chart(fig_ld_bk, use_container_width=True)
+
+                _ld_show = _latest_df.copy()
+                if ac_date in _ld_show.columns:
+                    try:
+                        _ld_show[ac_date] = _ld_show[ac_date].dt.strftime("%d %b %Y")
+                    except Exception:
+                        pass
+                st.dataframe(_ld_show, use_container_width=True, hide_index=True)
+                st.divider()
 
         # ── Full Ledger ─────────────────────────────────────────────────────────
         st.subheader("📋 Full Ledger")
