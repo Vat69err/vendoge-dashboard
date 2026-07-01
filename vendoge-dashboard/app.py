@@ -148,11 +148,14 @@ def load_data():
         # Date is stored as Excel date serial (e.g. 46203 = 2026-06-30)
         if "Date" in combined_txn.columns:
             _date_num = pd.to_numeric(combined_txn["Date"], errors="coerce")
-            combined_txn["date"] = pd.Timestamp("1899-12-30") + pd.to_timedelta(_date_num, unit="D")
+            _base = pd.Timestamp("1899-12-30")
+            combined_txn["date"] = _date_num.apply(
+                lambda x: _base + pd.Timedelta(days=int(x)) if pd.notna(x) else pd.NaT
+            )
         # Time is stored as Excel time fraction (e.g. 0.9951 = 23:53)
         if "Time" in combined_txn.columns:
             _time_num = pd.to_numeric(combined_txn["Time"], errors="coerce")
-            combined_txn["hour"] = (_time_num * 24).astype("Int64")
+            combined_txn["hour"] = (_time_num * 24).round().astype("Int64")
         for col in ["Machine", "Coil", "Unit Price", "Quantity", "Payment Price", "Discount"]:
             if col in combined_txn.columns:
                 combined_txn[col] = pd.to_numeric(
