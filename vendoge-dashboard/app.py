@@ -2932,7 +2932,9 @@ with tab_coil:
             )
 
             _machines_cr = sorted(cr[cr_machine].dropna().unique())
-            _cr_cols = st.columns(min(len(_machines_cr), 3))
+            if not _machines_cr:
+                st.info("No machine data found in this sheet.")
+            _cr_cols = st.columns(min(max(len(_machines_cr), 1), 3))
             for _ci, _m in enumerate(_machines_cr):
                 _mdf = _coil_freq[_coil_freq[cr_machine] == _m].head(10)
                 with _cr_cols[_ci % len(_cr_cols)]:
