@@ -31,9 +31,8 @@ st.set_page_config(
 # 1. CONFIG — loaded from Streamlit secrets
 # ============================================================
 try:
-    SHEET_ID              = st.secrets["sheets"]["dashboard"]
-    ACCOUNTS_SHEET_ID     = st.secrets["sheets"]["accounts"]
-    TRANSACTIONS_SHEET_ID = st.secrets["sheets"].get("transactions", "")
+    SHEET_ID          = st.secrets["sheets"]["dashboard"]
+    ACCOUNTS_SHEET_ID = st.secrets["sheets"]["accounts"]
     GIDS = {
         "sales":       str(st.secrets["gids"]["dashboard"]["sales"]),
         "refill":      str(st.secrets["gids"]["dashboard"]["refill"]),
@@ -41,8 +40,8 @@ try:
         "stock_in":    str(st.secrets["gids"]["dashboard"].get("stock_in", "")),
         "inventory":   str(st.secrets["gids"]["dashboard"].get("inventory", "")),
         "accounts":    str(st.secrets["gids"]["accounts"].get("accounts", "")),
-        "coil_refill": str(st.secrets.get("gids", {}).get("transactions", {}).get("coil_refill", "")),
-        "combined_txn": str(st.secrets.get("gids", {}).get("transactions", {}).get("combined_txn", "")),
+        "coil_refill": str(st.secrets["gids"]["dashboard"].get("coil_refill", "")),
+        "combined_txn": str(st.secrets["gids"]["dashboard"].get("combined_txn", "")),
     }
 except (KeyError, FileNotFoundError):
     st.error(
@@ -121,8 +120,8 @@ def load_data():
 
     # ── Coil Refilling Log ──────────────────────────────────────────────────────
     coil_refill = pd.DataFrame()
-    if GIDS.get("coil_refill") and TRANSACTIONS_SHEET_ID:
-        coil_refill = pd.read_csv(_sheet_url(GIDS["coil_refill"], sheet_id=TRANSACTIONS_SHEET_ID))
+    if GIDS.get("coil_refill"):
+        coil_refill = pd.read_csv(_sheet_url(GIDS["coil_refill"]))
         _cr_date = next((c for c in coil_refill.columns if "date" in c.lower()), None)
         if _cr_date:
             coil_refill[_cr_date] = pd.to_datetime(coil_refill[_cr_date], dayfirst=True, errors="coerce")
@@ -135,8 +134,8 @@ def load_data():
 
     # ── Combined Transactions Log ───────────────────────────────────────────────
     combined_txn = pd.DataFrame()
-    if GIDS.get("combined_txn") and TRANSACTIONS_SHEET_ID:
-        combined_txn = pd.read_csv(_sheet_url(GIDS["combined_txn"], sheet_id=TRANSACTIONS_SHEET_ID))
+    if GIDS.get("combined_txn"):
+        combined_txn = pd.read_csv(_sheet_url(GIDS["combined_txn"]))
         _ct_date = next((c for c in combined_txn.columns if "date" in c.lower()), None)
         _ct_time = next((c for c in combined_txn.columns if c.lower() in ("time", "transaction_time", "txn_time", "sale_time")), None)
         if _ct_date:
