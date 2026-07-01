@@ -119,47 +119,41 @@ def load_data():
                 )
 
     # ── Coil Refilling Log ──────────────────────────────────────────────────────
-    # Columns: Machine ID, Machine Location, Refiller Name, Refill At,
-    #          Product Name, Brand Name, Category, Price,
-    #          Coil/Compartment, Quantity After Refill,
-    #          Previous Product Quantity, Product Refilled
+    # Google Sheets CSV columns:
+    #   Machine, Coil, Refill At, Product, Previous Product,
+    #   Product Shifted, Refilled, Qty Before, Qty After, Qty Refilled
     coil_refill = pd.DataFrame()
     if GIDS.get("coil_refill"):
         coil_refill = pd.read_csv(_sheet_url(GIDS["coil_refill"]))
         if "Refill At" in coil_refill.columns:
-            coil_refill["date"] = pd.to_datetime(coil_refill["Refill At"], errors="coerce")
-        for col in ["Quantity After Refill", "Previous Product Quantity", "Price",
-                    "Machine ID", "Coil/Compartment"]:
+            # Format: "30 Jun 2026, 11:45" — strip comma before time for clean parsing
+            _cr_dt_str = coil_refill["Refill At"].astype(str).str.replace(
+                r",\s*(\d{1,2}:\d{2})", r" \1", regex=True
+            )
+            coil_refill["date"] = pd.to_datetime(_cr_dt_str, dayfirst=True, errors="coerce")
+        for col in ["Machine", "Coil", "Qty Before", "Qty After", "Qty Refilled"]:
             if col in coil_refill.columns:
                 coil_refill[col] = pd.to_numeric(
                     coil_refill[col].astype(str).str.replace(",", "").str.strip(), errors="coerce"
                 )
-        if "Quantity After Refill" in coil_refill.columns and "Previous Product Quantity" in coil_refill.columns:
-            coil_refill["qty_refilled"] = (
-                coil_refill["Quantity After Refill"] - coil_refill["Previous Product Quantity"]
-            ).clip(lower=0)
-        if "Machine ID" in coil_refill.columns:
-            coil_refill["machine"] = coil_refill["Machine ID"].astype(str)
 
     # ── Combined Transactions Log ───────────────────────────────────────────────
-    # Columns: Machine ID, Machine Name, Date, Time, Payment Gateway,
-    #          Payment Status, Dispense Status, Compartment/Coil,
-    #          Product Name, Brand Name, Unit Price, Quantity, Payment Price
+    # Google Sheets CSV columns:
+    #   Machine, Machine Name, Date (Excel serial int), Time (Excel fraction float),
+    #   Coil, Product, Unit Price, Quantity, Payment Price, Discount,
+    #   Gateway, Payment Status, Dispense Status
     combined_txn = pd.DataFrame()
     if GIDS.get("combined_txn"):
         combined_txn = pd.read_csv(_sheet_url(GIDS["combined_txn"]))
-        # Use "Date & Time" as the primary datetime source (most reliable column)
-        if "Date & Time" in combined_txn.columns:
-            combined_txn["date"] = pd.to_datetime(combined_txn["Date & Time"], errors="coerce")
-            combined_txn["hour"] = combined_txn["date"].dt.hour
-        elif "Date" in combined_txn.columns:
-            combined_txn["date"] = pd.to_datetime(combined_txn["Date"], errors="coerce")
-            if "Time" in combined_txn.columns:
-                combined_txn["hour"] = pd.to_datetime(
-                    combined_txn["Time"].astype(str), format="%H:%M:%S", errors="coerce"
-                ).dt.hour
-        for col in ["Unit Price", "Quantity", "Payment Price", "Discounted Value",
-                    "Machine ID", "Compartment/Coil"]:
+        # Date is stored as Excel date serial (e.g. 46203 = 2026-06-30)
+        if "Date" in combined_txn.columns:
+            _date_num = pd.to_numeric(combined_txn["Date"], errors="coerce")
+            combined_txn["date"] = pd.Timestamp("1899-12-30") + pd.to_timedelta(_date_num, unit="D")
+        # Time is stored as Excel time fraction (e.g. 0.9951 = 23:53)
+        if "Time" in combined_txn.columns:
+            _time_num = pd.to_numeric(combined_txn["Time"], errors="coerce")
+            combined_txn["hour"] = (_time_num * 24).astype("Int64")
+        for col in ["Machine", "Coil", "Unit Price", "Quantity", "Payment Price", "Discount"]:
             if col in combined_txn.columns:
                 combined_txn[col] = pd.to_numeric(
                     combined_txn[col].astype(str).str.replace(",", "").str.strip(), errors="coerce"
@@ -170,13 +164,12 @@ def load_data():
                 combined_txn["Payment Status"].astype(str).str.lower() == "success"
             ]
         if "Dispense Status" in combined_txn.columns:
-            # include "yes" and "yes(timeout)" — both mean the item was dispensed
             combined_txn = combined_txn[
                 combined_txn["Dispense Status"].astype(str).str.lower().str.startswith("yes")
             ]
         # Classify payment mode: cash vs cashless
-        if "Payment Gateway" in combined_txn.columns:
-            combined_txn["payment_mode"] = combined_txn["Payment Gateway"].apply(
+        if "Gateway" in combined_txn.columns:
+            combined_txn["payment_mode"] = combined_txn["Gateway"].apply(
                 lambda x: "Cash" if str(x).lower() == "cash" else "Cashless"
             )
 
@@ -2863,6 +2856,7 @@ with tab_verka:
 
 
 
+
 # ============================================================
 # COIL LOG TAB
 # ============================================================
@@ -2877,8 +2871,8 @@ with tab_coil:
     else:
         cr = coil_refill_df.copy()
 
-        # ── Tab-local filters (independent of sidebar) ───────────────────────────
-        _cr_machines_all = sorted(cr["Machine ID"].dropna().astype(int).astype(str).unique()) if "Machine ID" in cr.columns else []
+        # ── Tab-local filters ────────────────────────────────────────────────────
+        _cr_machines_all = sorted(cr["Machine"].dropna().astype(int).astype(str).unique()) if "Machine" in cr.columns else []
         _cr_date_min = cr["date"].dropna().min() if "date" in cr.columns and cr["date"].notna().any() else None
         _cr_date_max = cr["date"].dropna().max() if "date" in cr.columns and cr["date"].notna().any() else None
 
@@ -2898,51 +2892,43 @@ with tab_coil:
                 if isinstance(_cr_dr, tuple) and len(_cr_dr) == 2:
                     cr = cr[cr["date"].dt.date.between(_cr_dr[0], _cr_dr[1])]
 
-        if _cr_machine_sel and "Machine ID" in cr.columns:
-            cr = cr[cr["Machine ID"].dropna().astype(int).astype(str).isin(_cr_machine_sel)]
+        if _cr_machine_sel and "Machine" in cr.columns:
+            cr = cr[cr["Machine"].dropna().astype(int).astype(str).isin(_cr_machine_sel)]
 
         if cr.empty:
             st.warning("No data for the selected filters.")
         else:
             # ── KPI Row ───────────────────────────────────────────────────────────
-            _cr_events   = len(cr)
-            _cr_qty_ref  = cr["qty_refilled"].sum()       if "qty_refilled"         in cr.columns else 0
-            _cr_qty_aft  = cr["Quantity After Refill"].sum() if "Quantity After Refill" in cr.columns else 0
-            _cr_n_machines = cr["Machine ID"].nunique()   if "Machine ID"           in cr.columns else 0
-            _cr_n_coils    = cr["Coil/Compartment"].nunique() if "Coil/Compartment" in cr.columns else 0
+            _cr_events    = len(cr)
+            _cr_qty_ref   = cr["Qty Refilled"].sum()  if "Qty Refilled" in cr.columns else 0
+            _cr_qty_after = cr["Qty After"].sum()     if "Qty After"    in cr.columns else 0
+            _cr_n_mach    = cr["Machine"].nunique()   if "Machine"      in cr.columns else 0
+            _cr_n_coils   = cr["Coil"].nunique()      if "Coil"         in cr.columns else 0
 
             kc1, kc2, kc3, kc4, kc5 = st.columns(5)
-            kc1.metric("Refill Events",          f"{_cr_events:,}")
-            kc2.metric("Net Units Refilled",      f"{_cr_qty_ref:,.0f}")
-            kc3.metric("Total Qty After Refill",  f"{_cr_qty_aft:,.0f}")
-            kc4.metric("Machines",               f"{_cr_n_machines}")
-            kc5.metric("Coils Tracked",          f"{_cr_n_coils}")
+            kc1.metric("Refill Events",         f"{_cr_events:,}")
+            kc2.metric("Total Units Refilled",  f"{_cr_qty_ref:,.0f}")
+            kc3.metric("Total Qty After Refill",f"{_cr_qty_after:,.0f}")
+            kc4.metric("Machines",              f"{_cr_n_mach}")
+            kc5.metric("Coils Tracked",         f"{_cr_n_coils}")
 
             st.divider()
 
-            # friendly machine label: ID + location if available
-            if "Machine ID" in cr.columns:
-                cr["_machine_label"] = cr["Machine ID"].dropna().astype(int).astype(str)
-                if "Machine Location" in cr.columns:
-                    cr["_machine_label"] = cr.apply(
-                        lambda r: f"{int(r['Machine ID'])} – {r['Machine Location']}"
-                        if pd.notna(r["Machine ID"]) and str(r.get("Machine Location", "-")).strip() not in ("-", "", "nan")
-                        else (str(int(r["Machine ID"])) if pd.notna(r["Machine ID"]) else "—"),
-                        axis=1,
-                    )
-            _ml = "_machine_label" if "_machine_label" in cr.columns else None
-
             # ── Machine × Coil Heatmap ────────────────────────────────────────────
-            if _ml and "Coil/Compartment" in cr.columns:
+            if "Machine" in cr.columns and "Coil" in cr.columns:
                 st.subheader("🗺️ Refill Frequency — Machine × Coil Heatmap")
                 st.caption("How many times each coil was refilled per machine. High counts = fastest movers.")
-                _hm = cr.groupby([_ml, "Coil/Compartment"]).size().reset_index(name="refill_count")
-                _hm_pivot = _hm.pivot(index="Coil/Compartment", columns=_ml, values="refill_count").fillna(0)
+                _hm = (
+                    cr.groupby(["Machine", "Coil"]).size().reset_index(name="refill_count")
+                )
+                _hm["Machine"] = _hm["Machine"].astype(int).astype(str)
+                _hm["Coil"]    = _hm["Coil"].astype(int).astype(str)
+                _hm_pivot = _hm.pivot(index="Coil", columns="Machine", values="refill_count").fillna(0)
                 import plotly.graph_objects as _go_cr
                 fig_hm = _go_cr.Figure(data=_go_cr.Heatmap(
                     z=_hm_pivot.values,
                     x=_hm_pivot.columns.tolist(),
-                    y=_hm_pivot.index.astype(str).tolist(),
+                    y=_hm_pivot.index.tolist(),
                     colorscale="YlOrRd",
                     colorbar=dict(title="Refills"),
                     text=_hm_pivot.values,
@@ -2950,35 +2936,39 @@ with tab_coil:
                 ))
                 fig_hm.update_layout(
                     title="Coil Refill Frequency by Machine",
-                    xaxis_title="Machine", yaxis_title="Coil/Compartment",
+                    xaxis_title="Machine", yaxis_title="Coil",
                     height=max(420, len(_hm_pivot) * 24),
                 )
                 st.plotly_chart(fig_hm, use_container_width=True)
 
             # ── Fastest-Moving Coils per Machine ──────────────────────────────────
-            if _ml and "Coil/Compartment" in cr.columns and "Product Name" in cr.columns:
+            if "Machine" in cr.columns and "Coil" in cr.columns:
                 st.subheader("🏃 Fastest-Moving Coils per Machine")
-                _coil_freq = (
-                    cr.groupby([_ml, "Coil/Compartment", "Product Name"])
+                _coil_agg = (
+                    cr.groupby(["Machine", "Coil"])
                     .agg(
-                        refill_count=("Coil/Compartment", "count"),
-                        qty_net=("qty_refilled", "sum") if "qty_refilled" in cr.columns else ("Coil/Compartment", "count"),
+                        refill_count=("Coil", "count"),
+                        qty_refilled=("Qty Refilled", "sum") if "Qty Refilled" in cr.columns else ("Coil", "count"),
+                        product=("Product", lambda x: x.mode()[0] if len(x) else "—") if "Product" in cr.columns else ("Coil", "count"),
                     )
                     .reset_index()
-                    .sort_values("refill_count", ascending=False)
                 )
-                _cr_machine_list = sorted(cr[_ml].dropna().unique())
-                _cr_ncols = min(max(len(_cr_machine_list), 1), 3)
+                _coil_agg["Machine"] = _coil_agg["Machine"].astype(int).astype(str)
+                _coil_agg["Coil"]    = _coil_agg["Coil"].astype(int).astype(str)
+
+                _cr_mlist = sorted(_coil_agg["Machine"].unique())
+                _cr_ncols = min(max(len(_cr_mlist), 1), 3)
                 _cr_cols  = st.columns(_cr_ncols)
-                for _ci, _m in enumerate(_cr_machine_list):
-                    _mdf = _coil_freq[_coil_freq[_ml] == _m].head(15)
+                for _ci, _m in enumerate(_cr_mlist):
+                    _mdf = _coil_agg[_coil_agg["Machine"] == _m].sort_values("refill_count", ascending=False).head(15)
                     with _cr_cols[_ci % _cr_ncols]:
+                        _hover = {"product": True} if "product" in _mdf.columns else {}
                         fig_cf = px.bar(
                             _mdf.sort_values("refill_count"),
-                            x="refill_count", y="Coil/Compartment", orientation="h",
-                            title=_m,
+                            x="refill_count", y="Coil", orientation="h",
+                            title=f"Machine {_m}",
                             color_discrete_sequence=[PRIMARY],
-                            hover_data={"Product Name": True},
+                            hover_data=_hover,
                         )
                         fig_cf.update_layout(
                             xaxis_title="Refill Events", yaxis_title="Coil",
@@ -2987,83 +2977,67 @@ with tab_coil:
                         )
                         st.plotly_chart(fig_cf, use_container_width=True)
 
-            # ── Net Units Refilled per Coil ────────────────────────────────────────
-            if "Coil/Compartment" in cr.columns and "qty_refilled" in cr.columns:
-                st.subheader("📦 Net Units Refilled per Coil")
+            # ── Total Units Refilled per Coil ─────────────────────────────────────
+            if "Coil" in cr.columns and "Qty Refilled" in cr.columns:
+                st.subheader("📦 Total Units Refilled per Coil")
                 _coil_qty = (
-                    cr.groupby("Coil/Compartment")["qty_refilled"]
-                    .sum().sort_values(ascending=False).reset_index()
+                    cr.groupby("Coil")["Qty Refilled"].sum()
+                    .sort_values(ascending=False).reset_index()
                 )
+                _coil_qty["Coil"] = _coil_qty["Coil"].astype(int).astype(str)
                 fig_cq = px.bar(
-                    _coil_qty.head(20).sort_values("qty_refilled"),
-                    x="qty_refilled", y="Coil/Compartment", orientation="h",
-                    title="Top 20 Coils by Net Units Refilled",
+                    _coil_qty.head(20).sort_values("Qty Refilled"),
+                    x="Qty Refilled", y="Coil", orientation="h",
+                    title="Top 20 Coils by Total Units Refilled",
                     color_discrete_sequence=[ACCENT],
                 )
-                fig_cq.update_layout(
-                    xaxis_title="Units Refilled", yaxis_title="Coil",
-                    yaxis=dict(type="category"),
-                )
+                fig_cq.update_layout(xaxis_title="Units Refilled", yaxis_title="Coil",
+                                     yaxis=dict(type="category"))
                 st.plotly_chart(fig_cq, use_container_width=True)
 
             # ── Refill Events Over Time ────────────────────────────────────────────
             if "date" in cr.columns:
                 st.subheader("📈 Refill Events Over Time")
-                _grp = [cr["date"].dt.date]
-                if _ml:
-                    _grp.append(cr[_ml])
-                _cr_trend = cr.groupby(_grp).size().reset_index(name="events")
-                if _ml:
-                    _cr_trend.columns = ["date", _ml, "events"]
+                if "Machine" in cr.columns:
+                    _cr_trend = (
+                        cr.assign(_m=cr["Machine"].astype(int).astype(str))
+                        .groupby([cr["date"].dt.date, "_m"]).size().reset_index(name="events")
+                    )
+                    _cr_trend.columns = ["date", "Machine", "events"]
                     fig_crt = px.bar(
-                        _cr_trend, x="date", y="events", color=_ml,
+                        _cr_trend, x="date", y="events", color="Machine",
                         barmode="stack", title="Daily Refill Events by Machine",
                         color_discrete_sequence=px.colors.qualitative.Set2,
                     )
                 else:
-                    _cr_trend.columns = ["date", "events"]
-                    fig_crt = px.bar(
-                        _cr_trend, x="date", y="events",
-                        title="Daily Refill Events",
-                        color_discrete_sequence=[PRIMARY],
-                    )
+                    _cr_trend = cr.groupby(cr["date"].dt.date).size().reset_index(name="events")
+                    fig_crt = px.bar(_cr_trend, x="date", y="events",
+                                     title="Daily Refill Events",
+                                     color_discrete_sequence=[PRIMARY])
                 fig_crt.update_layout(xaxis_title="", yaxis_title="Refill Events")
                 st.plotly_chart(fig_crt, use_container_width=True)
 
             # ── Product ↔ Coil Mapping ─────────────────────────────────────────────
-            if "Coil/Compartment" in cr.columns and "Product Name" in cr.columns:
+            if "Coil" in cr.columns and "Product" in cr.columns:
                 st.subheader("🔗 Product ↔ Coil Mapping")
-                st.caption("Most common product per coil slot with refill count.")
-                _grp_cols = ([_ml] if _ml else []) + ["Coil/Compartment", "Product Name"]
+                st.caption("Most common product per coil slot, with refill count.")
+                _grp = (["Machine"] if "Machine" in cr.columns else []) + ["Coil", "Product"]
                 _pc_map = (
-                    cr.groupby(_grp_cols)
-                    .size().reset_index(name="refill_count")
+                    cr.assign(
+                        Machine=cr["Machine"].astype(int).astype(str) if "Machine" in cr.columns else None,
+                        Coil=cr["Coil"].astype(int).astype(str),
+                    )
+                    .groupby(_grp).size().reset_index(name="refill_count")
                     .sort_values("refill_count", ascending=False)
-                    .drop_duplicates(subset=([_ml] if _ml else []) + ["Coil/Compartment"])
-                    .sort_values(([_ml] if _ml else []) + ["Coil/Compartment"])
+                    .drop_duplicates(subset=(["Machine"] if "Machine" in cr.columns else []) + ["Coil"])
+                    .sort_values((["Machine"] if "Machine" in cr.columns else []) + ["Coil"])
                 )
                 st.dataframe(_pc_map, use_container_width=True, hide_index=True)
 
-            # ── Refiller Performance ───────────────────────────────────────────────
-            if "Refiller Name" in cr.columns:
-                st.subheader("👤 Refiller Performance")
-                _agg_dict = {"Refiller Name": "count"}
-                if "Coil/Compartment" in cr.columns:
-                    _agg_dict["Coil/Compartment"] = "nunique"
-                if "qty_refilled" in cr.columns:
-                    _agg_dict["qty_refilled"] = "sum"
-                _rf_perf = (
-                    cr.groupby("Refiller Name").agg(_agg_dict)
-                    .rename(columns={"Refiller Name": "events", "Coil/Compartment": "coils_covered"})
-                    .reset_index().sort_values("events", ascending=False)
-                )
-                st.dataframe(_rf_perf, use_container_width=True, hide_index=True)
-
             # ── Full Log ───────────────────────────────────────────────────────────
             with st.expander("📋 Full Coil Refilling Log"):
-                _cr_disp = cr.drop(columns=["_machine_label", "machine"], errors="ignore")
                 st.dataframe(
-                    _cr_disp.sort_values("date", ascending=False) if "date" in _cr_disp.columns else _cr_disp,
+                    cr.sort_values("date", ascending=False) if "date" in cr.columns else cr,
                     use_container_width=True, hide_index=True,
                 )
 
@@ -3082,7 +3056,7 @@ with tab_txn:
     else:
         ct = combined_txn_df.copy()
 
-        # ── Tab-local filters (independent of sidebar) ───────────────────────────
+        # ── Tab-local filters ────────────────────────────────────────────────────
         _ct_machines_all = sorted(ct["Machine Name"].dropna().unique()) if "Machine Name" in ct.columns else []
         _ct_date_min = ct["date"].dropna().min() if "date" in ct.columns and ct["date"].notna().any() else None
         _ct_date_max = ct["date"].dropna().max() if "date" in ct.columns and ct["date"].notna().any() else None
@@ -3145,7 +3119,7 @@ with tab_txn:
                 return                 "20–24 (Late Night)"
 
             if not has_hour:
-                st.info("No `Time` column with time-of-day data found — time bracket analysis unavailable.")
+                st.info("No time-of-day data found — time bracket analysis unavailable.")
             else:
                 ct["time_bracket"] = ct["hour"].apply(_bracket)
                 _tb = "Payment Price" if "Payment Price" in ct.columns else None
@@ -3193,7 +3167,7 @@ with tab_txn:
                     )
                     st.plotly_chart(fig_hm_txn, use_container_width=True)
 
-                    # Peak bracket per machine
+                    # Peak bracket per machine table
                     st.subheader("🏆 Peak Selling Time per Machine")
                     _peak_rows = []
                     for _m in sorted(_hm_pivot.index):
@@ -3203,10 +3177,10 @@ with tab_txn:
                         _total_m  = _row.sum()
                         _pct      = _peak_val / _total_m * 100 if _total_m else 0
                         _peak_rows.append({
-                            "Machine":             _m,
-                            "Peak Bracket":        _peak_br,
-                            "Revenue in Peak":     f"₹{_peak_val:,.0f}",
-                            "% of Machine Total":  f"{_pct:.1f}%",
+                            "Machine":            _m,
+                            "Peak Bracket":       _peak_br,
+                            "Revenue in Peak":    f"₹{_peak_val:,.0f}",
+                            "% of Machine Total": f"{_pct:.1f}%",
                         })
                     st.dataframe(pd.DataFrame(_peak_rows), use_container_width=True, hide_index=True)
 
@@ -3221,12 +3195,6 @@ with tab_txn:
                                                  "#9B59B6", "#1ABC9C", "#E74C3C"],
                     )
                     fig_hr.update_layout(yaxis_title="Revenue (₹)")
-                elif _tb:
-                    _hr_all = ct.groupby("hour")[_tb].sum().reset_index()
-                    fig_hr  = px.line(_hr_all, x="hour", y=_tb, markers=True,
-                                      title="Revenue by Hour",
-                                      color_discrete_sequence=[PRIMARY])
-                    fig_hr.update_layout(yaxis_title="Revenue (₹)")
                 else:
                     _hr_cnt = ct.groupby("hour").size().reset_index(name="transactions")
                     fig_hr  = px.line(_hr_cnt, x="hour", y="transactions", markers=True,
@@ -3239,7 +3207,7 @@ with tab_txn:
                 # Day of Week × Hour heatmap
                 if "date" in ct.columns and _tb:
                     st.subheader("📅 Day of Week × Hour Heatmap")
-                    st.caption("Best day-hour combos — great for scheduling refills before peak windows.")
+                    st.caption("Best day-hour combos — schedule refills before peak windows.")
                     _DOW_MAP   = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
                     _DOW_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
                     ct["_dow"] = ct["date"].dt.dayofweek.map(_DOW_MAP)
@@ -3249,7 +3217,7 @@ with tab_txn:
                     import plotly.graph_objects as _go_dh
                     fig_dh = _go_dh.Figure(data=_go_dh.Heatmap(
                         z=_dh_pivot.values,
-                        x=[f"{h:02d}:00" for h in _dh_pivot.columns],
+                        x=[f"{int(h):02d}:00" for h in _dh_pivot.columns],
                         y=_dh_pivot.index.tolist(),
                         colorscale="Blues",
                         colorbar=dict(title="Revenue ₹"),
@@ -3262,7 +3230,7 @@ with tab_txn:
 
             st.divider()
 
-            # ── Payment Mode Breakdown ────────────────────────────────────────────
+            # ── Cash vs Cashless ──────────────────────────────────────────────────
             if "payment_mode" in ct.columns:
                 st.subheader("💳 Cash vs Cashless Breakdown")
                 _pm_c1, _pm_c2 = st.columns(2)
@@ -3301,11 +3269,11 @@ with tab_txn:
                     st.plotly_chart(fig_pm3, use_container_width=True)
 
             # ── Top Products ──────────────────────────────────────────────────────
-            if "Product Name" in ct.columns:
+            if "Product" in ct.columns:
                 st.subheader("🏆 Top Products")
                 _tp_c1, _tp_c2 = st.columns(2)
                 with _tp_c1:
-                    _prod_cnt = ct["Product Name"].value_counts().head(15).reset_index()
+                    _prod_cnt = ct["Product"].value_counts().head(15).reset_index()
                     _prod_cnt.columns = ["product", "transactions"]
                     fig_tp = px.bar(
                         _prod_cnt.sort_values("transactions"),
@@ -3318,7 +3286,7 @@ with tab_txn:
                 with _tp_c2:
                     if "Payment Price" in ct.columns:
                         _prod_rev = (
-                            ct.groupby("Product Name")["Payment Price"]
+                            ct.groupby("Product")["Payment Price"]
                             .sum().sort_values(ascending=False).head(15).reset_index()
                         )
                         _prod_rev.columns = ["product", "revenue"]
@@ -3356,7 +3324,7 @@ with tab_txn:
 
             # ── Full Log ───────────────────────────────────────────────────────────
             with st.expander("📋 Full Transaction Log"):
-                _ct_disp = ct.drop(columns=["_dow", "time_bracket", "payment_mode", "hour"], errors="ignore")
+                _ct_disp = ct.drop(columns=["_dow", "time_bracket", "payment_mode"], errors="ignore")
                 st.dataframe(
                     _ct_disp.sort_values("date", ascending=False) if "date" in _ct_disp.columns else _ct_disp,
                     use_container_width=True, hide_index=True,
