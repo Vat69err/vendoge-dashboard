@@ -31,15 +31,18 @@ st.set_page_config(
 # 1. CONFIG — loaded from Streamlit secrets
 # ============================================================
 try:
-    SHEET_ID          = st.secrets["sheets"]["dashboard"]
-    ACCOUNTS_SHEET_ID = st.secrets["sheets"]["accounts"]
+    SHEET_ID              = st.secrets["sheets"]["dashboard"]
+    ACCOUNTS_SHEET_ID     = st.secrets["sheets"]["accounts"]
+    TRANSACTIONS_SHEET_ID = st.secrets["sheets"].get("transactions", "")
     GIDS = {
-        "sales":     str(st.secrets["gids"]["dashboard"]["sales"]),
-        "refill":    str(st.secrets["gids"]["dashboard"]["refill"]),
-        "stockout":  str(st.secrets["gids"]["dashboard"]["stockout"]),
-        "stock_in":  str(st.secrets["gids"]["dashboard"].get("stock_in", "")),
-        "inventory": str(st.secrets["gids"]["dashboard"].get("inventory", "")),
-        "accounts":  str(st.secrets["gids"]["accounts"].get("accounts", "")),
+        "sales":       str(st.secrets["gids"]["dashboard"]["sales"]),
+        "refill":      str(st.secrets["gids"]["dashboard"]["refill"]),
+        "stockout":    str(st.secrets["gids"]["dashboard"]["stockout"]),
+        "stock_in":    str(st.secrets["gids"]["dashboard"].get("stock_in", "")),
+        "inventory":   str(st.secrets["gids"]["dashboard"].get("inventory", "")),
+        "accounts":    str(st.secrets["gids"]["accounts"].get("accounts", "")),
+        "coil_refill": str(st.secrets.get("gids", {}).get("transactions", {}).get("coil_refill", "")),
+        "combined_txn": str(st.secrets.get("gids", {}).get("transactions", {}).get("combined_txn", "")),
     }
 except (KeyError, FileNotFoundError):
     st.error(
@@ -116,11 +119,55 @@ def load_data():
                     errors="coerce",
                 )
 
-    return sales, refill, stockout, stock_in, inventory, accounts
+    # ── Coil Refilling Log ──────────────────────────────────────────────────────
+    coil_refill = pd.DataFrame()
+    if GIDS.get("coil_refill") and TRANSACTIONS_SHEET_ID:
+        coil_refill = pd.read_csv(_sheet_url(GIDS["coil_refill"], sheet_id=TRANSACTIONS_SHEET_ID))
+        _cr_date = next((c for c in coil_refill.columns if "date" in c.lower()), None)
+        if _cr_date:
+            coil_refill[_cr_date] = pd.to_datetime(coil_refill[_cr_date], dayfirst=True, errors="coerce")
+            coil_refill = coil_refill.rename(columns={_cr_date: "date"})
+        for col in coil_refill.columns:
+            if any(k in col.lower() for k in ["qty", "quantity", "count", "units", "refill"]):
+                coil_refill[col] = pd.to_numeric(
+                    coil_refill[col].astype(str).str.replace(",", "").str.strip(), errors="coerce"
+                )
+
+    # ── Combined Transactions Log ───────────────────────────────────────────────
+    combined_txn = pd.DataFrame()
+    if GIDS.get("combined_txn") and TRANSACTIONS_SHEET_ID:
+        combined_txn = pd.read_csv(_sheet_url(GIDS["combined_txn"], sheet_id=TRANSACTIONS_SHEET_ID))
+        _ct_date = next((c for c in combined_txn.columns if "date" in c.lower()), None)
+        _ct_time = next((c for c in combined_txn.columns if c.lower() in ("time", "transaction_time", "txn_time", "sale_time")), None)
+        if _ct_date:
+            combined_txn[_ct_date] = pd.to_datetime(combined_txn[_ct_date], dayfirst=True, errors="coerce")
+            combined_txn = combined_txn.rename(columns={_ct_date: "date"})
+        if _ct_time and _ct_time != "date":
+            # Try to parse time and extract hour for bracket analysis
+            try:
+                combined_txn["_time_parsed"] = pd.to_datetime(
+                    combined_txn["date"].dt.strftime("%Y-%m-%d") + " " + combined_txn[_ct_time].astype(str),
+                    errors="coerce"
+                )
+                combined_txn["hour"] = combined_txn["_time_parsed"].dt.hour
+                combined_txn = combined_txn.drop(columns=["_time_parsed"])
+            except Exception:
+                pass
+        elif "date" in combined_txn.columns and combined_txn["date"].dtype == "datetime64[ns]":
+            # If date column already has time component, extract hour
+            combined_txn["hour"] = combined_txn["date"].dt.hour
+        for col in combined_txn.columns:
+            if any(k in col.lower() for k in ["amount", "amt", "price", "value", "sales", "qty", "quantity", "count"]):
+                combined_txn[col] = pd.to_numeric(
+                    combined_txn[col].astype(str).str.replace(",", "").str.replace("₹", "").str.strip(),
+                    errors="coerce"
+                )
+
+    return sales, refill, stockout, stock_in, inventory, accounts, coil_refill, combined_txn
 
 
 try:
-    sales_df, refill_df, stockout_df, stock_in_df, inventory_df, accounts_df = load_data()
+    sales_df, refill_df, stockout_df, stock_in_df, inventory_df, accounts_df, coil_refill_df, combined_txn_df = load_data()
 except Exception as e:
     st.error(
         "Couldn't load the Google Sheet. Most likely causes:\n\n"
@@ -350,8 +397,8 @@ if not _default_stock_table.empty:
 # ============================================================
 # 7. TABS
 # ============================================================
-tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops, tab_accounts, tab_inv, tab_verka = st.tabs(
-    ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions", "⚙️ Operations", "💳 Accounts", "📦 Inventory & Stock", "🥛 Verka"]
+tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops, tab_accounts, tab_inv, tab_verka, tab_coil, tab_txn = st.tabs(
+    ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions", "⚙️ Operations", "💳 Accounts", "📦 Inventory & Stock", "🥛 Verka", "🔩 Coil Log", "📋 Transactions"]
 )
 
 # ---------- OVERVIEW ----------
@@ -2796,3 +2843,493 @@ with tab_verka:
     with st.expander("📋 Full Verka Sales Log"):
         st.dataframe(vk_sales.sort_values("date", ascending=False),
                      use_container_width=True, hide_index=True)
+
+# ============================================================
+# COIL LOG TAB
+# ============================================================
+with tab_coil:
+    st.subheader("🔩 Machine Wise Coil Refilling Log")
+
+    if coil_refill_df.empty:
+        st.info(
+            "No coil refilling data loaded. Add `[sheets] transactions` and "
+            "`[gids.transactions] coil_refill` to your Streamlit secrets."
+        )
+    else:
+        cr = coil_refill_df.copy()
+
+        # ── Column detection ────────────────────────────────────────────────────
+        def _find_col(df, *keywords):
+            for c in df.columns:
+                if any(k in c.lower() for k in keywords):
+                    return c
+            return None
+
+        cr_machine = _find_col(cr, "machine")
+        cr_coil    = _find_col(cr, "coil")
+        cr_product = _find_col(cr, "product")
+        cr_brand   = _find_col(cr, "brand")
+        cr_qty     = _find_col(cr, "refill_qty", "refill qty", "quantity", "qty", "units")
+        cr_before  = _find_col(cr, "before", "qty_before", "opening")
+        cr_after   = _find_col(cr, "after", "qty_after", "closing")
+        cr_refiller = _find_col(cr, "refiller", "operator", "person")
+
+        # Date range filter (reuse sidebar dates)
+        if "date" in cr.columns:
+            cr = cr[cr["date"].dt.date.between(start_date, end_date)]
+        if cr_machine and machine_sel:
+            cr = cr[cr[cr_machine].astype(str).isin([str(m) for m in machine_sel])]
+
+        # ── KPI Row ─────────────────────────────────────────────────────────────
+        _cr_total_refills = len(cr)
+        _cr_total_qty = pd.to_numeric(cr[cr_qty], errors="coerce").sum() if cr_qty else 0
+        _cr_machines = cr[cr_machine].nunique() if cr_machine else 0
+        _cr_coils    = cr[cr_coil].nunique()    if cr_coil   else 0
+
+        kc1, kc2, kc3, kc4 = st.columns(4)
+        kc1.metric("Total Refill Events", f"{_cr_total_refills:,}")
+        kc2.metric("Total Units Refilled", f"{_cr_total_qty:,.0f}")
+        kc3.metric("Machines Covered", f"{_cr_machines}")
+        kc4.metric("Unique Coils Tracked", f"{_cr_coils}")
+
+        st.divider()
+
+        # ── Machine × Coil Heatmap ──────────────────────────────────────────────
+        if cr_machine and cr_coil:
+            st.subheader("🗺️ Refill Frequency — Machine × Coil Heatmap")
+            st.caption("How many times each coil was refilled per machine. High-frequency coils are your fastest movers.")
+            _hm = (
+                cr.groupby([cr_machine, cr_coil]).size().reset_index(name="refill_count")
+            )
+            _hm_pivot = _hm.pivot(index=cr_coil, columns=cr_machine, values="refill_count").fillna(0)
+            import plotly.graph_objects as _go
+            fig_hm = _go.Figure(data=_go.Heatmap(
+                z=_hm_pivot.values,
+                x=_hm_pivot.columns.tolist(),
+                y=_hm_pivot.index.tolist(),
+                colorscale="YlOrRd",
+                colorbar=dict(title="Refill Count"),
+                hoverongaps=False,
+            ))
+            fig_hm.update_layout(
+                title="Coil Refill Frequency by Machine",
+                xaxis_title="Machine", yaxis_title="Coil",
+                height=max(400, len(_hm_pivot) * 22),
+            )
+            st.plotly_chart(fig_hm, use_container_width=True)
+
+        # ── Fastest-Moving Coils per Machine ────────────────────────────────────
+        if cr_machine and cr_coil:
+            st.subheader("🏃 Fastest-Moving Coils per Machine")
+            _coil_freq = (
+                cr.groupby([cr_machine, cr_coil])
+                .agg(
+                    refill_count=(cr_coil, "count"),
+                    **({cr_qty.replace(" ", "_"): (cr_qty, "sum")} if cr_qty else {}),
+                    **({cr_product: (cr_product, lambda x: x.mode()[0] if len(x) else "—")} if cr_product else {}),
+                )
+                .reset_index()
+                .sort_values("refill_count", ascending=False)
+            )
+
+            _machines_cr = sorted(cr[cr_machine].dropna().unique())
+            _cr_cols = st.columns(min(len(_machines_cr), 3))
+            for _ci, _m in enumerate(_machines_cr):
+                _mdf = _coil_freq[_coil_freq[cr_machine] == _m].head(10)
+                with _cr_cols[_ci % len(_cr_cols)]:
+                    fig_cf = px.bar(
+                        _mdf.sort_values("refill_count"),
+                        x="refill_count", y=cr_coil, orientation="h",
+                        title=f"{_m} — Top Coils",
+                        color_discrete_sequence=[PRIMARY],
+                        hover_data={cr_product: True} if cr_product and cr_product in _mdf.columns else {},
+                    )
+                    fig_cf.update_layout(
+                        xaxis_title="Refill Events", yaxis_title="Coil",
+                        height=max(250, len(_mdf) * 36),
+                    )
+                    st.plotly_chart(fig_cf, use_container_width=True)
+
+        # ── Refill Volume per Coil (qty) ─────────────────────────────────────────
+        if cr_coil and cr_qty:
+            st.subheader("📦 Total Units Refilled per Coil")
+            _coil_qty = (
+                cr.groupby(cr_coil)[cr_qty].sum().sort_values(ascending=False).reset_index()
+            )
+            fig_cq = px.bar(
+                _coil_qty.head(20).sort_values(cr_qty),
+                x=cr_qty, y=cr_coil, orientation="h",
+                title="Top 20 Coils by Total Qty Refilled",
+                color_discrete_sequence=[ACCENT],
+            )
+            fig_cq.update_layout(xaxis_title="Units Refilled", yaxis_title="Coil")
+            st.plotly_chart(fig_cq, use_container_width=True)
+
+        # ── Refill Trend Over Time ───────────────────────────────────────────────
+        if "date" in cr.columns:
+            st.subheader("📈 Refill Events Over Time")
+            _cr_grp_cols = ["date"]
+            if cr_machine:
+                _cr_grp_cols.append(cr_machine)
+            _cr_trend = cr.groupby([cr["date"].dt.date] + ([cr_machine] if cr_machine else [])).size().reset_index(name="events")
+            _cr_trend.columns = ["date"] + ([cr_machine] if cr_machine else []) + ["events"]
+
+            if cr_machine:
+                fig_crt = px.bar(
+                    _cr_trend, x="date", y="events", color=cr_machine,
+                    barmode="stack", title="Daily Coil Refill Events by Machine",
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+            else:
+                fig_crt = px.bar(
+                    _cr_trend, x="date", y="events",
+                    title="Daily Coil Refill Events",
+                    color_discrete_sequence=[PRIMARY],
+                )
+            fig_crt.update_layout(xaxis_title="", yaxis_title="Refill Events")
+            st.plotly_chart(fig_crt, use_container_width=True)
+
+        # ── Product × Coil Mapping ───────────────────────────────────────────────
+        if cr_coil and cr_product:
+            st.subheader("🔗 Product ↔ Coil Mapping")
+            st.caption("Shows which product is most commonly loaded in each coil, and how often that coil was refilled.")
+            _pc_map = (
+                cr.groupby([cr_coil, cr_product])
+                .size().reset_index(name="refill_count")
+                .sort_values([cr_coil, "refill_count"], ascending=[True, False])
+                .drop_duplicates(subset=[cr_coil])
+            )
+            if cr_machine:
+                _pc_map_m = (
+                    cr.groupby([cr_machine, cr_coil, cr_product])
+                    .size().reset_index(name="refill_count")
+                    .sort_values([cr_machine, cr_coil, "refill_count"], ascending=[True, True, False])
+                    .drop_duplicates(subset=[cr_machine, cr_coil])
+                    .sort_values([cr_machine, "refill_count"], ascending=[True, False])
+                )
+                st.dataframe(_pc_map_m, use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(_pc_map, use_container_width=True, hide_index=True)
+
+        # ── Full Log ─────────────────────────────────────────────────────────────
+        with st.expander("📋 Full Coil Refilling Log"):
+            st.dataframe(
+                cr.sort_values("date", ascending=False) if "date" in cr.columns else cr,
+                use_container_width=True, hide_index=True,
+            )
+
+
+# ============================================================
+# TRANSACTIONS TAB
+# ============================================================
+with tab_txn:
+    st.subheader("📋 Combined Transactions Log")
+
+    if combined_txn_df.empty:
+        st.info(
+            "No transaction data loaded. Add `[sheets] transactions` and "
+            "`[gids.transactions] combined_txn` to your Streamlit secrets."
+        )
+    else:
+        ct = combined_txn_df.copy()
+
+        # ── Column detection ────────────────────────────────────────────────────
+        def _find_txn_col(df, *keywords):
+            for c in df.columns:
+                if any(k in c.lower() for k in keywords):
+                    return c
+            return None
+
+        ct_machine  = _find_txn_col(ct, "machine")
+        ct_product  = _find_txn_col(ct, "product")
+        ct_brand    = _find_txn_col(ct, "brand")
+        ct_coil     = _find_txn_col(ct, "coil")
+        ct_amount   = _find_txn_col(ct, "amount", "amt", "price", "value", "sales")
+        ct_qty      = _find_txn_col(ct, "qty", "quantity", "units", "count")
+        ct_payment  = _find_txn_col(ct, "payment", "mode", "type", "cash")
+
+        # Apply sidebar date & machine filters
+        if "date" in ct.columns:
+            ct = ct[ct["date"].dt.date.between(start_date, end_date)]
+        if ct_machine and machine_sel:
+            ct = ct[ct[ct_machine].astype(str).isin([str(m) for m in machine_sel])]
+
+        has_hour = "hour" in ct.columns and ct["hour"].notna().any()
+
+        # ── KPI Row ─────────────────────────────────────────────────────────────
+        _ct_total_txn = len(ct)
+        _ct_total_amt = pd.to_numeric(ct[ct_amount], errors="coerce").sum() if ct_amount else 0
+        _ct_total_qty = pd.to_numeric(ct[ct_qty],    errors="coerce").sum() if ct_qty    else 0
+        _ct_machines  = ct[ct_machine].nunique() if ct_machine else 0
+
+        tk1, tk2, tk3, tk4 = st.columns(4)
+        tk1.metric("Total Transactions", f"{_ct_total_txn:,}")
+        tk2.metric("Total Revenue",      f"₹{_ct_total_amt:,.0f}" if ct_amount else "—")
+        tk3.metric("Units Sold",         f"{_ct_total_qty:,.0f}"  if ct_qty    else "—")
+        tk4.metric("Machines",           f"{_ct_machines}")
+
+        st.divider()
+
+        # ── Time Bracket Analysis ───────────────────────────────────────────────
+        st.subheader("⏰ Time Bracket Analysis — When Do You Sell the Most?")
+
+        if not has_hour:
+            st.info(
+                "No time-of-day data found in this sheet. "
+                "To enable time bracket analysis, ensure your Combined Transactions sheet has a "
+                "column named `time`, `transaction_time`, or `sale_time` containing the time of each transaction."
+            )
+        else:
+            # Bracket labels
+            def _bracket(h):
+                if h < 6:   return "00–06 (Night)"
+                if h < 9:   return "06–09 (Early Morning)"
+                if h < 12:  return "09–12 (Morning)"
+                if h < 14:  return "12–14 (Lunch)"
+                if h < 17:  return "14–17 (Afternoon)"
+                if h < 20:  return "17–20 (Evening)"
+                return              "20–24 (Night)"
+
+            _BRACKET_ORDER = [
+                "00–06 (Night)", "06–09 (Early Morning)", "09–12 (Morning)",
+                "12–14 (Lunch)", "14–17 (Afternoon)", "17–20 (Evening)", "20–24 (Night)",
+            ]
+
+            ct["time_bracket"] = ct["hour"].apply(_bracket)
+
+            # --- Overall bracket bar ----
+            _tb_metric = ct_amount if ct_amount else (ct_qty if ct_qty else None)
+            if _tb_metric:
+                _tb_agg = (
+                    ct.groupby("time_bracket")[_tb_metric]
+                    .sum().reindex(_BRACKET_ORDER).reset_index()
+                )
+                _tb_agg.columns = ["bracket", "value"]
+                fig_tb = px.bar(
+                    _tb_agg, x="bracket", y="value",
+                    title=f"{'Revenue' if _tb_metric == ct_amount else 'Units'} by Time Bracket (all machines)",
+                    color_discrete_sequence=[PRIMARY],
+                    category_orders={"bracket": _BRACKET_ORDER},
+                )
+                fig_tb.update_layout(
+                    xaxis_title="", yaxis_title=f"{'₹ Revenue' if _tb_metric == ct_amount else 'Units'}",
+                    xaxis_tickangle=-30,
+                )
+                st.plotly_chart(fig_tb, use_container_width=True)
+
+            # --- Machine × Time Bracket Heatmap ----
+            if ct_machine and _tb_metric:
+                st.subheader("🗺️ Machine × Time Bracket Heatmap")
+                st.caption(
+                    "Each cell shows revenue (or units) generated in that time bracket for that machine. "
+                    "Darker = more sales. Use this to plan refill timing and staffing."
+                )
+                _hm_txn = (
+                    ct.groupby([ct_machine, "time_bracket"])[_tb_metric]
+                    .sum().reset_index()
+                )
+                _hm_txn_pivot = (
+                    _hm_txn.pivot(index=ct_machine, columns="time_bracket", values=_tb_metric)
+                    .reindex(columns=_BRACKET_ORDER)
+                    .fillna(0)
+                )
+                import plotly.graph_objects as _go2
+                fig_hm_txn = _go2.Figure(data=_go2.Heatmap(
+                    z=_hm_txn_pivot.values,
+                    x=_hm_txn_pivot.columns.tolist(),
+                    y=_hm_txn_pivot.index.tolist(),
+                    colorscale="YlOrRd",
+                    colorbar=dict(title="Revenue ₹" if _tb_metric == ct_amount else "Units"),
+                    text=_hm_txn_pivot.values,
+                    texttemplate="%{text:,.0f}",
+                ))
+                fig_hm_txn.update_layout(
+                    title="Machine × Time Bracket",
+                    xaxis_title="Time Bracket", yaxis_title="Machine",
+                    height=max(300, len(_hm_txn_pivot) * 60 + 100),
+                    xaxis_tickangle=-30,
+                )
+                st.plotly_chart(fig_hm_txn, use_container_width=True)
+
+                # Per-machine peak bracket callout
+                st.subheader("🏆 Peak Selling Bracket per Machine")
+                _peak_rows = []
+                for _m in sorted(_hm_txn_pivot.index):
+                    _row = _hm_txn_pivot.loc[_m]
+                    _peak_br = _row.idxmax()
+                    _peak_val = _row.max()
+                    _total_m = _row.sum()
+                    _pct = _peak_val / _total_m * 100 if _total_m else 0
+                    _peak_rows.append({
+                        "Machine": _m,
+                        "Peak Bracket": _peak_br,
+                        "Revenue in Peak" if _tb_metric == ct_amount else "Units in Peak": f"{'₹' if _tb_metric == ct_amount else ''}{_peak_val:,.0f}",
+                        "% of Machine Total": f"{_pct:.1f}%",
+                    })
+                st.dataframe(pd.DataFrame(_peak_rows), use_container_width=True, hide_index=True)
+
+            # --- Hourly trend line (granular) ----
+            st.subheader("📈 Hour-by-Hour Sales Profile")
+            if ct_machine and _tb_metric:
+                _hr_m = (
+                    ct.groupby([ct_machine, "hour"])[_tb_metric]
+                    .sum().reset_index()
+                )
+                fig_hr = px.line(
+                    _hr_m, x="hour", y=_tb_metric, color=ct_machine,
+                    markers=True,
+                    title="Sales by Hour of Day (per Machine)",
+                    color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C"],
+                )
+            elif _tb_metric:
+                _hr_all = ct.groupby("hour")[_tb_metric].sum().reset_index()
+                fig_hr = px.line(
+                    _hr_all, x="hour", y=_tb_metric,
+                    markers=True, title="Sales by Hour of Day",
+                    color_discrete_sequence=[PRIMARY],
+                )
+            else:
+                _hr_cnt = ct.groupby("hour").size().reset_index(name="transactions")
+                fig_hr = px.line(
+                    _hr_cnt, x="hour", y="transactions",
+                    markers=True, title="Transactions by Hour",
+                    color_discrete_sequence=[PRIMARY],
+                )
+            fig_hr.update_layout(
+                xaxis=dict(title="Hour of Day", tickmode="linear", tick0=0, dtick=1),
+                yaxis_title="Revenue (₹)" if _tb_metric == ct_amount else "Units / Transactions",
+            )
+            st.plotly_chart(fig_hr, use_container_width=True)
+
+            # --- Day of Week × Hour heatmap ----
+            if "date" in ct.columns:
+                st.subheader("📅 Day of Week × Hour Heatmap")
+                st.caption("Which day-hour combinations drive the most sales — helps optimize refill schedules.")
+                _dow_map = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
+                ct["_dow"] = ct["date"].dt.dayofweek
+                ct["_dow_label"] = ct["_dow"].map(_dow_map)
+                _dh_metric = _tb_metric if _tb_metric else None
+                if _dh_metric:
+                    _dh = ct.groupby(["_dow", "_dow_label", "hour"])[_dh_metric].sum().reset_index()
+                    _dh_pivot = _dh.pivot(index="_dow_label", columns="hour", values=_dh_metric).fillna(0)
+                    _DOW_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                    _dh_pivot = _dh_pivot.reindex([d for d in _DOW_ORDER if d in _dh_pivot.index])
+                    import plotly.graph_objects as _go3
+                    fig_dh = _go3.Figure(data=_go3.Heatmap(
+                        z=_dh_pivot.values,
+                        x=[f"{h:02d}:00" for h in _dh_pivot.columns],
+                        y=_dh_pivot.index.tolist(),
+                        colorscale="Blues",
+                        colorbar=dict(title="Revenue ₹" if _dh_metric == ct_amount else "Units"),
+                    ))
+                    fig_dh.update_layout(
+                        title="Revenue by Day × Hour",
+                        xaxis_title="Hour", yaxis_title="Day",
+                        height=320,
+                    )
+                    st.plotly_chart(fig_dh, use_container_width=True)
+
+        st.divider()
+
+        # ── Payment Mode Breakdown ──────────────────────────────────────────────
+        if ct_payment:
+            st.subheader("💳 Payment Mode Breakdown")
+            _pm_c1, _pm_c2 = st.columns(2)
+            _pm_counts = ct[ct_payment].value_counts().reset_index()
+            _pm_counts.columns = ["mode", "count"]
+
+            with _pm_c1:
+                fig_pm = px.pie(
+                    _pm_counts, names="mode", values="count", hole=0.5,
+                    title="Transactions by Payment Mode",
+                    color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C"],
+                )
+                st.plotly_chart(fig_pm, use_container_width=True)
+
+            with _pm_c2:
+                if ct_amount:
+                    _pm_rev = ct.groupby(ct_payment)[ct_amount].sum().reset_index()
+                    _pm_rev.columns = ["mode", "revenue"]
+                    fig_pm2 = px.bar(
+                        _pm_rev, x="mode", y="revenue",
+                        title="Revenue by Payment Mode",
+                        color_discrete_sequence=[PRIMARY, ACCENT],
+                    )
+                    fig_pm2.update_layout(xaxis_title="", yaxis_title="Revenue (₹)")
+                    st.plotly_chart(fig_pm2, use_container_width=True)
+
+            if ct_machine and has_hour and ct_amount:
+                _pm_hr = ct.groupby([ct_payment, "hour"])[ct_amount].sum().reset_index()
+                _pm_hr.columns = ["mode", "hour", "revenue"]
+                fig_pm3 = px.line(
+                    _pm_hr, x="hour", y="revenue", color="mode",
+                    markers=True, title="Payment Mode Revenue by Hour of Day",
+                    color_discrete_sequence=[PRIMARY, ACCENT],
+                )
+                fig_pm3.update_layout(
+                    xaxis=dict(title="Hour", tickmode="linear", tick0=0, dtick=1),
+                    yaxis_title="Revenue (₹)",
+                )
+                st.plotly_chart(fig_pm3, use_container_width=True)
+
+        # ── Top Products in Transactions ─────────────────────────────────────────
+        if ct_product:
+            st.subheader("🏆 Top Products by Transactions")
+            _tp_c1, _tp_c2 = st.columns(2)
+            with _tp_c1:
+                _prod_cnt = ct[ct_product].value_counts().head(15).reset_index()
+                _prod_cnt.columns = ["product", "count"]
+                fig_tp = px.bar(
+                    _prod_cnt.sort_values("count"),
+                    x="count", y="product", orientation="h",
+                    title="Top 15 Products by Transaction Count",
+                    color_discrete_sequence=[PRIMARY],
+                )
+                fig_tp.update_layout(xaxis_title="Transactions", yaxis_title="")
+                st.plotly_chart(fig_tp, use_container_width=True)
+
+            with _tp_c2:
+                if ct_amount:
+                    _prod_rev = ct.groupby(ct_product)[ct_amount].sum().sort_values(ascending=False).head(15).reset_index()
+                    _prod_rev.columns = ["product", "revenue"]
+                    fig_tr = px.bar(
+                        _prod_rev.sort_values("revenue"),
+                        x="revenue", y="product", orientation="h",
+                        title="Top 15 Products by Revenue",
+                        color_discrete_sequence=[ACCENT],
+                    )
+                    fig_tr.update_layout(xaxis_title="Revenue (₹)", yaxis_title="")
+                    st.plotly_chart(fig_tr, use_container_width=True)
+
+        # ── Daily Transaction Trend ─────────────────────────────────────────────
+        if "date" in ct.columns:
+            st.subheader("📈 Daily Transaction Trend")
+            _ct_daily_cols = [ct["date"].dt.date]
+            if ct_machine:
+                _ct_daily_cols.append(ct[ct_machine])
+            _ct_daily = ct.groupby([ct["date"].dt.date] + ([ct[ct_machine]] if ct_machine else [])).size().reset_index(name="transactions")
+
+            if ct_machine:
+                _ct_daily.columns = ["date", ct_machine, "transactions"]
+                fig_ctd = px.line(
+                    _ct_daily, x="date", y="transactions", color=ct_machine,
+                    markers=True, title="Daily Transactions by Machine",
+                    color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C"],
+                )
+            else:
+                _ct_daily.columns = ["date", "transactions"]
+                fig_ctd = px.area(
+                    _ct_daily, x="date", y="transactions",
+                    title="Daily Transactions",
+                    color_discrete_sequence=[PRIMARY],
+                )
+            fig_ctd.update_layout(xaxis_title="", yaxis_title="Transactions")
+            st.plotly_chart(fig_ctd, use_container_width=True)
+
+        # ── Full Log ─────────────────────────────────────────────────────────────
+        with st.expander("📋 Full Transaction Log"):
+            _ct_display = ct.drop(columns=["_dow", "_dow_label", "time_bracket"], errors="ignore")
+            st.dataframe(
+                _ct_display.sort_values("date", ascending=False) if "date" in _ct_display.columns else _ct_display,
+                use_container_width=True, hide_index=True,
+            )
