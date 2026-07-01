@@ -2872,7 +2872,7 @@ with tab_coil:
         cr = coil_refill_df.copy()
 
         # ── Tab-local filters ────────────────────────────────────────────────────
-        _cr_machines_all = sorted(cr["Machine"].dropna().astype(int).astype(str).unique()) if "Machine" in cr.columns else []
+        _cr_machines_all = sorted(pd.to_numeric(cr["Machine"], errors="coerce").dropna().astype(int).astype(str).unique()) if "Machine" in cr.columns else []
         _cr_date_min = cr["date"].dropna().min() if "date" in cr.columns and cr["date"].notna().any() else None
         _cr_date_max = cr["date"].dropna().max() if "date" in cr.columns and cr["date"].notna().any() else None
 
@@ -2893,7 +2893,7 @@ with tab_coil:
                     cr = cr[cr["date"].dt.date.between(_cr_dr[0], _cr_dr[1])]
 
         if _cr_machine_sel and "Machine" in cr.columns:
-            cr = cr[cr["Machine"].dropna().astype(int).astype(str).isin(_cr_machine_sel)]
+            cr = cr[pd.to_numeric(cr["Machine"], errors="coerce").dropna().astype(int).astype(str).isin(_cr_machine_sel)]
 
         if cr.empty:
             st.warning("No data for the selected filters.")
@@ -2921,8 +2921,8 @@ with tab_coil:
                 _hm = (
                     cr.groupby(["Machine", "Coil"]).size().reset_index(name="refill_count")
                 )
-                _hm["Machine"] = _hm["Machine"].astype(int).astype(str)
-                _hm["Coil"]    = _hm["Coil"].astype(int).astype(str)
+                _hm["Machine"] = pd.to_numeric(_hm["Machine"], errors="coerce").astype("Int64").astype(str)
+                _hm["Coil"]    = pd.to_numeric(_hm["Coil"],    errors="coerce").astype("Int64").astype(str)
                 _hm_pivot = _hm.pivot(index="Coil", columns="Machine", values="refill_count").fillna(0)
                 import plotly.graph_objects as _go_cr
                 fig_hm = _go_cr.Figure(data=_go_cr.Heatmap(
@@ -2953,8 +2953,8 @@ with tab_coil:
                     )
                     .reset_index()
                 )
-                _coil_agg["Machine"] = _coil_agg["Machine"].astype(int).astype(str)
-                _coil_agg["Coil"]    = _coil_agg["Coil"].astype(int).astype(str)
+                _coil_agg["Machine"] = pd.to_numeric(_coil_agg["Machine"], errors="coerce").astype("Int64").astype(str)
+                _coil_agg["Coil"]    = pd.to_numeric(_coil_agg["Coil"],    errors="coerce").astype("Int64").astype(str)
 
                 _cr_mlist = sorted(_coil_agg["Machine"].unique())
                 _cr_ncols = min(max(len(_cr_mlist), 1), 3)
@@ -2984,7 +2984,7 @@ with tab_coil:
                     cr.groupby("Coil")["Qty Refilled"].sum()
                     .sort_values(ascending=False).reset_index()
                 )
-                _coil_qty["Coil"] = _coil_qty["Coil"].astype(int).astype(str)
+                _coil_qty["Coil"] = pd.to_numeric(_coil_qty["Coil"], errors="coerce").astype("Int64").astype(str)
                 fig_cq = px.bar(
                     _coil_qty.head(20).sort_values("Qty Refilled"),
                     x="Qty Refilled", y="Coil", orientation="h",
@@ -3000,7 +3000,7 @@ with tab_coil:
                 st.subheader("📈 Refill Events Over Time")
                 if "Machine" in cr.columns:
                     _cr_trend = (
-                        cr.assign(_m=cr["Machine"].astype(int).astype(str))
+                        cr.assign(_m=pd.to_numeric(cr["Machine"], errors="coerce").astype("Int64").astype(str))
                         .groupby([cr["date"].dt.date, "_m"]).size().reset_index(name="events")
                     )
                     _cr_trend.columns = ["date", "Machine", "events"]
@@ -3024,8 +3024,8 @@ with tab_coil:
                 _grp = (["Machine"] if "Machine" in cr.columns else []) + ["Coil", "Product"]
                 _pc_map = (
                     cr.assign(
-                        Machine=cr["Machine"].astype(int).astype(str) if "Machine" in cr.columns else None,
-                        Coil=cr["Coil"].astype(int).astype(str),
+                        Machine=pd.to_numeric(cr["Machine"], errors="coerce").astype("Int64").astype(str) if "Machine" in cr.columns else None,
+                        Coil=pd.to_numeric(cr["Coil"], errors="coerce").astype("Int64").astype(str),
                     )
                     .groupby(_grp).size().reset_index(name="refill_count")
                     .sort_values("refill_count", ascending=False)
