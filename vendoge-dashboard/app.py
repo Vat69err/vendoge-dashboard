@@ -2901,6 +2901,31 @@ with tab_coil:
         if cr.empty:
             st.warning("No data for the selected filters.")
         else:
+            # ── D / D-1 / D-2 / Avg helpers ──────────────────────────────────────
+            def _cr_day_agg(df, col="Qty Refilled"):
+                if "date" not in df.columns or col not in df.columns:
+                    return {}
+                _daily = df.groupby(df["date"].dt.date)[col].sum().sort_index()
+                _dates = _daily.index.tolist()
+                if not _dates:
+                    return {}
+                _d   = _daily.iloc[-1]
+                _d1  = _daily.iloc[-2] if len(_dates) >= 2 else None
+                _d2  = _daily.iloc[-3] if len(_dates) >= 3 else None
+                _avg = _daily.mean()
+                return {"D": _d, "D-1": _d1, "D-2": _d2, "avg": _avg,
+                        "D_date": _dates[-1],
+                        "D1_date": _dates[-2] if len(_dates) >= 2 else None,
+                        "D2_date": _dates[-3] if len(_dates) >= 3 else None}
+
+            _cr_day = _cr_day_agg(cr)
+
+            def _delta_str(val, ref):
+                if val is None or ref is None:
+                    return None
+                d = val - ref
+                return f"{'+' if d >= 0 else ''}{d:,.0f} vs prev day"
+
             # ── KPI Row ───────────────────────────────────────────────────────────
             _cr_events    = len(cr)
             _cr_qty_ref   = cr["Qty Refilled"].sum()  if "Qty Refilled" in cr.columns else 0
@@ -2914,6 +2939,28 @@ with tab_coil:
             kc3.metric("Total Qty After Refill",f"{_cr_qty_after:,.0f}")
             kc4.metric("Machines",              f"{_cr_n_mach}")
             kc5.metric("Coils Tracked",         f"{_cr_n_coils}")
+
+            # ── Day-over-Day Comparison ───────────────────────────────────────────
+            if _cr_day:
+                st.caption("Day-over-day: units refilled")
+                _dd1, _dd2, _dd3, _dd4 = st.columns(4)
+                _dd1.metric(
+                    f"D ({_cr_day['D_date']})",
+                    f"{_cr_day['D']:,.0f}",
+                    delta=_delta_str(_cr_day["D"], _cr_day["D-1"]),
+                )
+                if _cr_day["D-1"] is not None:
+                    _dd2.metric(
+                        f"D-1 ({_cr_day['D1_date']})",
+                        f"{_cr_day['D-1']:,.0f}",
+                        delta=_delta_str(_cr_day["D-1"], _cr_day["D-2"]),
+                    )
+                if _cr_day["D-2"] is not None:
+                    _dd3.metric(
+                        f"D-2 ({_cr_day['D2_date']})",
+                        f"{_cr_day['D-2']:,.0f}",
+                    )
+                _dd4.metric("Daily Avg", f"{_cr_day['avg']:,.0f}")
 
             st.divider()
 
@@ -3088,6 +3135,32 @@ with tab_txn:
         else:
             has_hour = "hour" in ct.columns and ct["hour"].notna().any()
 
+            # ── D / D-1 / D-2 / Avg helpers ──────────────────────────────────────
+            def _ct_day_agg(df, col):
+                if "date" not in df.columns or col not in df.columns:
+                    return {}
+                _daily = df.groupby(df["date"].dt.date)[col].sum().sort_index()
+                _dates = _daily.index.tolist()
+                if not _dates:
+                    return {}
+                _d   = _daily.iloc[-1]
+                _d1  = _daily.iloc[-2] if len(_dates) >= 2 else None
+                _d2  = _daily.iloc[-3] if len(_dates) >= 3 else None
+                _avg = _daily.mean()
+                return {"D": _d, "D-1": _d1, "D-2": _d2, "avg": _avg,
+                        "D_date": _dates[-1],
+                        "D1_date": _dates[-2] if len(_dates) >= 2 else None,
+                        "D2_date": _dates[-3] if len(_dates) >= 3 else None}
+
+            def _ct_delta(val, ref, prefix=""):
+                if val is None or ref is None:
+                    return None
+                d = val - ref
+                return f"{'+' if d >= 0 else ''}{prefix}{d:,.0f} vs prev"
+
+            _ct_rev_day = _ct_day_agg(ct, "Payment Price")
+            _ct_qty_day = _ct_day_agg(ct, "Quantity")
+
             # ── KPI Row ───────────────────────────────────────────────────────────
             _ct_txn      = len(ct)
             _ct_rev      = ct["Payment Price"].sum() if "Payment Price" in ct.columns else 0
@@ -3099,6 +3172,31 @@ with tab_txn:
             tk2.metric("Total Revenue", f"₹{_ct_rev:,.0f}")
             tk3.metric("Units Sold",   f"{_ct_qty:,.0f}")
             tk4.metric("Machines",     f"{_ct_machines}")
+
+            # ── Day-over-Day Comparison ───────────────────────────────────────────
+            if _ct_rev_day:
+                st.caption("Day-over-day: revenue (₹) / units sold")
+                _td1, _td2, _td3, _td4 = st.columns(4)
+                _td1.metric(
+                    f"D ({_ct_rev_day['D_date']})",
+                    f"₹{_ct_rev_day['D']:,.0f}  |  {_ct_qty_day.get('D', 0):,.0f} units",
+                    delta=_ct_delta(_ct_rev_day["D"], _ct_rev_day["D-1"], "₹"),
+                )
+                if _ct_rev_day["D-1"] is not None:
+                    _td2.metric(
+                        f"D-1 ({_ct_rev_day['D1_date']})",
+                        f"₹{_ct_rev_day['D-1']:,.0f}  |  {_ct_qty_day.get('D-1', 0) or 0:,.0f} units",
+                        delta=_ct_delta(_ct_rev_day["D-1"], _ct_rev_day["D-2"], "₹"),
+                    )
+                if _ct_rev_day["D-2"] is not None:
+                    _td3.metric(
+                        f"D-2 ({_ct_rev_day['D2_date']})",
+                        f"₹{_ct_rev_day['D-2']:,.0f}  |  {_ct_qty_day.get('D-2', 0) or 0:,.0f} units",
+                    )
+                _td4.metric(
+                    "Daily Avg",
+                    f"₹{_ct_rev_day['avg']:,.0f}  |  {_ct_qty_day.get('avg', 0) or 0:,.0f} units",
+                )
 
             st.divider()
 
