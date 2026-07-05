@@ -2896,7 +2896,7 @@ with tab_coil:
                     cr = cr[cr["date"].dt.date.between(_cr_dr[0], _cr_dr[1])]
 
         if _cr_machine_sel and "Machine" in cr.columns:
-            cr = cr[pd.to_numeric(cr["Machine"], errors="coerce").dropna().astype(int).astype(str).isin(_cr_machine_sel)]
+            cr = cr[pd.to_numeric(cr["Machine"], errors="coerce").astype("Int64").astype(str).isin(_cr_machine_sel)]
 
         if cr.empty:
             st.warning("No data for the selected filters.")
