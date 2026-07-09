@@ -1394,8 +1394,8 @@ with tab_accounts:
 
         # P&L bucket soft-classification (works even if bucket names change slightly)
         def _bk_is(series, *patterns):
-            return series.astype(str).str.lower().str.strip().apply(
-                lambda b: any(p in b for p in patterns)
+            return series.fillna("").astype(str).str.lower().str.strip().apply(
+                lambda b: isinstance(b, str) and any(p in b for p in patterns)
             )
 
         if ac_bucket:
@@ -2077,8 +2077,8 @@ with tab_hr:
             _HR_KEYWORDS = ["employee", "staff", "salary", "salaries", "wage", "payroll", "hr "]
 
             def _hr_is(series):
-                return series.astype(str).str.lower().str.strip().apply(
-                    lambda v: any(k in v for k in _HR_KEYWORDS)
+                return series.fillna("").astype(str).str.lower().str.strip().apply(
+                    lambda v: isinstance(v, str) and any(k in v for k in _HR_KEYWORDS)
                 )
 
             _hr_mask = pd.Series(False, index=accounts_df.index)
