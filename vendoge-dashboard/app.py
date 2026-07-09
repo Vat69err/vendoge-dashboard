@@ -410,8 +410,8 @@ if not _default_stock_table.empty:
 # ============================================================
 # 7. TABS
 # ============================================================
-tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops, tab_accounts, tab_inv, tab_verka, tab_coil, tab_txn = st.tabs(
-    ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions", "⚙️ Operations", "💳 Accounts", "📦 Inventory & Stock", "🥛 Verka", "🔩 Coil Log", "📋 Transactions"]
+tab_overview, tab_sales, tab_refill, tab_stockout, tab_predict, tab_ops, tab_accounts, tab_hr, tab_inv, tab_verka, tab_coil, tab_txn = st.tabs(
+    ["📊 Overview", "🛒 Machine Sales", "🔁 Refilling", "🚫 Stock-Outs", "🔮 Predictions", "⚙️ Operations", "💳 Accounts", "👥 HR", "📦 Inventory & Stock", "🥛 Verka", "🔩 Coil Log", "📋 Transactions"]
 )
 
 # ---------- OVERVIEW ----------
@@ -2032,7 +2032,229 @@ with tab_accounts:
             )
 
 # ============================================================
-# 9. INVENTORY & STOCK TAB
+# 9. HR TAB — employee payments, sourced from the Accounts ledger
+# ============================================================
+with tab_hr:
+    st.subheader("👥 HR — Employee Payments")
+
+    if accounts_df.empty:
+        st.info(
+            "No accounts data loaded. Add `accounts` to `[gids.accounts]` in your Streamlit secrets."
+        )
+    else:
+        def _find_hr_col(*keywords):
+            for c in accounts_df.columns:
+                cl = c.lower().strip()
+                if any(k in cl for k in keywords):
+                    return c
+            return None
+
+        hr_date         = _find_hr_col("date")
+        hr_debit        = _find_hr_col("withdrawal", "debit", " dr", "dr.")
+        hr_credit       = _find_hr_col("deposit", "credit", " cr", "cr.")
+        hr_amount       = _find_hr_col("amount", "amt", "net (") if not (hr_debit and hr_credit) else None
+        hr_desc         = _find_hr_col("narration", "description", "particulars", "detail", "remark", "note", "memo")
+        hr_cat          = _find_hr_col("category", "account", "head", "ledger", "group")
+        hr_bucket       = _find_hr_col("bucket")
+        hr_contact      = _find_hr_col("contact n", "vendor", "payee", "party")
+        hr_contact_type = _find_hr_col("contact type", "contact_type")
+
+        has_debit_credit = bool(hr_debit and hr_credit)
+        has_amount       = bool(hr_amount)
+
+        if not hr_contact or not (has_debit_credit or has_amount):
+            st.info(
+                "Couldn't find a contact/payee column and an amount column in the Accounts sheet — "
+                "HR analysis needs both to identify who was paid and how much."
+            )
+        else:
+            _HR_CHART_H = 420
+            _HR_MONEY_AXIS = dict(tickformat=",.0f", tickprefix="₹")
+
+            # ── Identify employee/payroll rows by keyword match on category, bucket,
+            # contact type or narration — same soft-classification approach as the
+            # Accounts tab's bucket detection.
+            _HR_KEYWORDS = ["employee", "staff", "salary", "salaries", "wage", "payroll", "hr "]
+
+            def _hr_is(series):
+                return series.astype(str).str.lower().str.strip().apply(
+                    lambda v: any(k in v for k in _HR_KEYWORDS)
+                )
+
+            _hr_mask = pd.Series(False, index=accounts_df.index)
+            if hr_contact_type:
+                _hr_mask |= _hr_is(accounts_df[hr_contact_type])
+            if hr_cat:
+                _hr_mask |= _hr_is(accounts_df[hr_cat])
+            if hr_bucket:
+                _hr_mask |= _hr_is(accounts_df[hr_bucket])
+            if hr_desc:
+                _hr_mask |= _hr_is(accounts_df[hr_desc])
+
+            hr_df = accounts_df[_hr_mask].copy()
+
+            if hr_df.empty:
+                st.info(
+                    "No employee/payroll transactions detected. Tag employee payments in your Accounts "
+                    "sheet with a Category, Bucket, Contact Type or Narration containing "
+                    "'Salary', 'Wages', 'Staff', 'Employee' or 'Payroll' for them to show up here."
+                )
+            else:
+                # ── Date filter ────────────────────────────────────────────────
+                if hr_date and not hr_df[hr_date].isna().all():
+                    hr_min = hr_df[hr_date].dropna().min()
+                    hr_max = hr_df[hr_date].dropna().max()
+                    _hr_dr = st.date_input(
+                        "Filter by date",
+                        value=(hr_min.date(), hr_max.date()),
+                        min_value=hr_min.date(),
+                        max_value=hr_max.date(),
+                        key="hr_date_range",
+                    )
+                    if isinstance(_hr_dr, tuple) and len(_hr_dr) == 2:
+                        hr_start, hr_end = _hr_dr
+                        hr_df = hr_df[
+                            (hr_df[hr_date].dt.date >= hr_start) &
+                            (hr_df[hr_date].dt.date <= hr_end)
+                        ]
+
+                _all_emp = sorted(hr_df[hr_contact].dropna().unique().tolist())
+                _sel_emp = st.multiselect("Filter by employee", _all_emp, default=_all_emp, key="hr_employees")
+                if _sel_emp:
+                    hr_df = hr_df[hr_df[hr_contact].isin(_sel_emp)]
+
+                # ── Amount paid per row (money going out to the employee) ───────
+                if has_debit_credit:
+                    hr_df["_paid"] = pd.to_numeric(hr_df[hr_debit], errors="coerce").fillna(0)
+                else:
+                    hr_df["_paid"] = pd.to_numeric(hr_df[hr_amount], errors="coerce").fillna(0)
+
+                # ── KPI Row ────────────────────────────────────────────────────
+                _total_paid  = hr_df["_paid"].sum()
+                _n_employees = hr_df[hr_contact].nunique()
+                _n_payments  = len(hr_df)
+                _avg_payment = hr_df["_paid"].mean() if _n_payments else 0
+
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Total Paid Out", f"₹{_total_paid:,.0f}")
+                k2.metric("Employees",      f"{_n_employees:,}")
+                k3.metric("Payments",       f"{_n_payments:,}")
+                k4.metric("Avg. Payment",   f"₹{_avg_payment:,.0f}")
+
+                if hr_date and not hr_df[hr_date].isna().all():
+                    _this_month = pd.Timestamp.now().to_period("M")
+                    _mtd = hr_df[hr_df[hr_date].dt.to_period("M") == _this_month]["_paid"].sum()
+                    st.caption(f"Paid so far this month ({_this_month}): ₹{_mtd:,.0f}")
+
+                st.divider()
+
+                # ── Per-employee summary ──────────────────────────────────────
+                st.subheader("🧾 Per-Employee Summary")
+                _emp_summary = hr_df.groupby(hr_contact).agg(
+                    **{
+                        "Total Paid":  ("_paid", "sum"),
+                        "Payments":    ("_paid", "count"),
+                        "Avg Payment": ("_paid", "mean"),
+                    }
+                )
+                if hr_date:
+                    _emp_summary["Last Paid"]  = hr_df.groupby(hr_contact)[hr_date].max()
+                    _emp_summary["First Paid"] = hr_df.groupby(hr_contact)[hr_date].min()
+                _emp_summary = _emp_summary.reset_index().rename(columns={hr_contact: "Employee"})
+                _emp_summary = _emp_summary.sort_values("Total Paid", ascending=False)
+
+                _es1, _es2 = st.columns(2)
+                with _es1:
+                    fig_emp = px.bar(
+                        _emp_summary.sort_values("Total Paid"),
+                        x="Total Paid", y="Employee", orientation="h",
+                        title="Total Paid by Employee",
+                        color_discrete_sequence=[PRIMARY],
+                        template="plotly_white",
+                        height=max(_HR_CHART_H, len(_emp_summary) * 28 + 120),
+                    )
+                    fig_emp.update_layout(xaxis=dict(title="Amount", **_HR_MONEY_AXIS), yaxis_title="")
+                    st.plotly_chart(fig_emp, use_container_width=True)
+
+                with _es2:
+                    _pie_df = _emp_summary[_emp_summary["Total Paid"] > 0]
+                    fig_pie = px.pie(
+                        _pie_df, names="Employee", values="Total Paid",
+                        hole=0.45, title="Payroll Share by Employee",
+                        color_discrete_sequence=[PRIMARY, ACCENT, "#6C8EBF", "#B85C5C", "#8CC99E", "#C8A28C"],
+                    )
+                    fig_pie.update_traces(textinfo="label+percent", textfont_size=12)
+                    fig_pie.update_layout(height=_HR_CHART_H, showlegend=False)
+                    st.plotly_chart(fig_pie, use_container_width=True)
+
+                _emp_disp = _emp_summary.copy()
+                for _col in ["Total Paid", "Avg Payment"]:
+                    _emp_disp[_col] = _emp_disp[_col].apply(lambda x: f"₹{x:,.0f}")
+                for _col in ["Last Paid", "First Paid"]:
+                    if _col in _emp_disp.columns:
+                        _emp_disp[_col] = _emp_disp[_col].dt.strftime("%d %b %Y")
+                st.dataframe(_emp_disp, use_container_width=True, hide_index=True)
+                st.divider()
+
+                # ── Monthly payroll trend ───────────────────────────────────────
+                if hr_date and not hr_df[hr_date].isna().all():
+                    st.subheader("📅 Monthly Payroll Trend")
+                    _mo_hr = hr_df.copy()
+                    _mo_hr["_month"] = _mo_hr[hr_date].dt.to_period("M").astype(str)
+                    _mo_hr_sum = _mo_hr.groupby(["_month", hr_contact])["_paid"].sum().reset_index()
+                    _mo_hr_sum.columns = ["Month", "Employee", "Amount"]
+                    fig_mo_hr = px.bar(
+                        _mo_hr_sum, x="Month", y="Amount", color="Employee", barmode="stack",
+                        title="Monthly Payroll by Employee",
+                        template="plotly_white",
+                    )
+                    fig_mo_hr.update_layout(
+                        xaxis_title="",
+                        yaxis=dict(title="Amount", **_HR_MONEY_AXIS),
+                        legend_title="",
+                        height=_HR_CHART_H,
+                    )
+                    st.plotly_chart(fig_mo_hr, use_container_width=True)
+                    st.divider()
+
+                # ── Full payment history ────────────────────────────────────────
+                st.subheader("📋 Full Payment History")
+                _hr_cols = []
+                if hr_date:
+                    _hr_cols.append(hr_date)
+                _hr_cols.append(hr_contact)
+                _hr_cols.append("_paid")
+                if hr_cat:
+                    _hr_cols.append(hr_cat)
+                if hr_bucket:
+                    _hr_cols.append(hr_bucket)
+                if hr_desc:
+                    _hr_cols.append(hr_desc)
+
+                _hr_hist = hr_df[_hr_cols].copy().rename(columns={hr_contact: "Employee", "_paid": "Amount Paid"})
+                if hr_date:
+                    _hr_hist = _hr_hist.rename(columns={hr_date: "Date"}).sort_values("Date", ascending=False)
+                    _hr_hist["Date"] = _hr_hist["Date"].dt.strftime("%d %b %Y")
+                if hr_cat:
+                    _hr_hist = _hr_hist.rename(columns={hr_cat: "Category"})
+                if hr_bucket:
+                    _hr_hist = _hr_hist.rename(columns={hr_bucket: "Bucket"})
+                if hr_desc:
+                    _hr_hist = _hr_hist.rename(columns={hr_desc: "Note"})
+                _hr_hist["Amount Paid"] = _hr_hist["Amount Paid"].apply(lambda x: f"₹{x:,.0f}")
+                st.dataframe(_hr_hist, use_container_width=True, hide_index=True)
+
+                with st.expander("ℹ️ How employees are detected", expanded=False):
+                    st.caption(
+                        "A transaction is treated as an employee/payroll payment if its Category, Bucket, "
+                        "Contact Type, or Narration contains any of: "
+                        f"{', '.join(sorted(set(k.strip() for k in _HR_KEYWORDS)))}. "
+                        "Tag your Accounts sheet accordingly (e.g. Category = 'Salary', Contact Type = 'Employee') "
+                        "for accurate payroll tracking — the payee/contact name is used as the employee name."
+                    )
+
+# ============================================================
+# 10. INVENTORY & STOCK TAB
 # ============================================================
 with tab_inv:
     no_stock_in = stock_in_df.empty
@@ -2438,7 +2660,7 @@ with tab_inv:
                     use_container_width=True, hide_index=True,
                 )
 # ============================================================
-# 10. VERKA TAB
+# 11. VERKA TAB
 # ============================================================
 with tab_verka:
     VERKA = "Verka"
