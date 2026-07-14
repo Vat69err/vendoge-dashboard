@@ -276,9 +276,9 @@ def period_avgs(daily_series: pd.Series) -> dict:
     """
     if daily_series.empty:
         return {
-            "latest": 0.0, "day_m1": 0.0, "day_m2": 0.0,
+            "latest": 0.0, "day_m1": 0.0, "day_m2": 0.0, "day_m3": 0.0,
             "avg_3d": 0.0, "avg_7d": 0.0, "avg_15d": 0.0, "avg_all": 0.0,
-            "date_latest": None, "date_m1": None, "date_m2": None,
+            "date_latest": None, "date_m1": None, "date_m2": None, "date_m3": None,
         }
     s = daily_series.sort_index()
     latest_date = s.index.max()
@@ -293,6 +293,7 @@ def period_avgs(daily_series: pd.Series) -> dict:
         "latest": float(s.iloc[-1]),
         "day_m1": float(s.iloc[-2]) if len(s) >= 2 else 0.0,
         "day_m2": float(s.iloc[-3]) if len(s) >= 3 else 0.0,
+        "day_m3": float(s.iloc[-4]) if len(s) >= 4 else 0.0,
         "avg_3d": _avg(3),
         "avg_7d": _avg(7),
         "avg_15d": _avg(15),
@@ -300,13 +301,15 @@ def period_avgs(daily_series: pd.Series) -> dict:
         "date_latest": dates[-1],
         "date_m1": dates[-2] if len(dates) >= 2 else None,
         "date_m2": dates[-3] if len(dates) >= 3 else None,
+        "date_m3": dates[-4] if len(dates) >= 4 else None,
     }
 
 
-def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}", inverse: bool = False):
+def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}", inverse: bool = False, show_d3: bool = False):
     """
-    Render a labelled 7-column snapshot strip with delta arrows.
-    Latest shows Δ vs Day-1; Day-1 shows Δ vs Day-2; averages show trend vs next wider window.
+    Render a labelled snapshot strip with delta arrows (7 columns, or 8 when show_d3=True).
+    Latest shows Δ vs Day-1; Day-1 shows Δ vs Day-2; Day-2 shows Δ vs Day-3 (when shown);
+    averages show trend vs next wider window.
     Set inverse=True for metrics where a higher value is bad (e.g. stock-outs).
     """
     def _delta(a, b):
@@ -330,14 +333,26 @@ def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}", inverse: bool 
     d_15va, col_15va = _delta(avgs["avg_15d"], avgs["avg_all"])
 
     st.caption(f"**{label}**")
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    c1.metric(_lbl("date_latest"), fmt.format(avgs["latest"]), delta=d_lat, delta_color=col_lat)
-    c2.metric(_lbl("date_m1") + " (D−1)", fmt.format(avgs["day_m1"]), delta=d_m1, delta_color=col_m1)
-    c3.metric(_lbl("date_m2") + " (D−2)", fmt.format(avgs["day_m2"]))
-    c4.metric("Avg 3d", fmt.format(avgs["avg_3d"]), delta=d_3v7, delta_color=col_3v7)
-    c5.metric("Avg 7d", fmt.format(avgs["avg_7d"]), delta=d_7v15, delta_color=col_7v15)
-    c6.metric("Avg 15d", fmt.format(avgs["avg_15d"]), delta=d_15va, delta_color=col_15va)
-    c7.metric("Overall Avg/Day", fmt.format(avgs["avg_all"]))
+    if show_d3:
+        d_m2, col_m2 = _delta(avgs["day_m2"], avgs.get("day_m3", 0.0))
+        c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+        c1.metric(_lbl("date_latest"), fmt.format(avgs["latest"]), delta=d_lat, delta_color=col_lat)
+        c2.metric(_lbl("date_m1") + " (D−1)", fmt.format(avgs["day_m1"]), delta=d_m1, delta_color=col_m1)
+        c3.metric(_lbl("date_m2") + " (D−2)", fmt.format(avgs["day_m2"]), delta=d_m2, delta_color=col_m2)
+        c4.metric(_lbl("date_m3") + " (D−3)", fmt.format(avgs.get("day_m3", 0.0)))
+        c5.metric("Avg 3d", fmt.format(avgs["avg_3d"]), delta=d_3v7, delta_color=col_3v7)
+        c6.metric("Avg 7d", fmt.format(avgs["avg_7d"]), delta=d_7v15, delta_color=col_7v15)
+        c7.metric("Avg 15d", fmt.format(avgs["avg_15d"]), delta=d_15va, delta_color=col_15va)
+        c8.metric("Overall Avg/Day", fmt.format(avgs["avg_all"]))
+    else:
+        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+        c1.metric(_lbl("date_latest"), fmt.format(avgs["latest"]), delta=d_lat, delta_color=col_lat)
+        c2.metric(_lbl("date_m1") + " (D−1)", fmt.format(avgs["day_m1"]), delta=d_m1, delta_color=col_m1)
+        c3.metric(_lbl("date_m2") + " (D−2)", fmt.format(avgs["day_m2"]))
+        c4.metric("Avg 3d", fmt.format(avgs["avg_3d"]), delta=d_3v7, delta_color=col_3v7)
+        c5.metric("Avg 7d", fmt.format(avgs["avg_7d"]), delta=d_7v15, delta_color=col_7v15)
+        c6.metric("Avg 15d", fmt.format(avgs["avg_15d"]), delta=d_15va, delta_color=col_15va)
+        c7.metric("Overall Avg/Day", fmt.format(avgs["avg_all"]))
 
 
 # ============================================================
@@ -3357,32 +3372,6 @@ with tab_txn:
         else:
             has_hour = "hour" in ct.columns and ct["hour"].notna().any()
 
-            # ── D / D-1 / D-2 / Avg helpers ──────────────────────────────────────
-            def _ct_day_agg(df, col):
-                if "date" not in df.columns or col not in df.columns:
-                    return {}
-                _daily = df.groupby(df["date"].dt.date)[col].sum().sort_index()
-                _dates = _daily.index.tolist()
-                if not _dates:
-                    return {}
-                _d   = _daily.iloc[-1]
-                _d1  = _daily.iloc[-2] if len(_dates) >= 2 else None
-                _d2  = _daily.iloc[-3] if len(_dates) >= 3 else None
-                _avg = _daily.mean()
-                return {"D": _d, "D-1": _d1, "D-2": _d2, "avg": _avg,
-                        "D_date": _dates[-1],
-                        "D1_date": _dates[-2] if len(_dates) >= 2 else None,
-                        "D2_date": _dates[-3] if len(_dates) >= 3 else None}
-
-            def _ct_delta(val, ref, prefix=""):
-                if val is None or ref is None:
-                    return None
-                d = val - ref
-                return f"{'+' if d >= 0 else ''}{prefix}{d:,.0f} vs prev"
-
-            _ct_rev_day = _ct_day_agg(ct, "Payment Price")
-            _ct_qty_day = _ct_day_agg(ct, "Quantity")
-
             # ── KPI Row ───────────────────────────────────────────────────────────
             _ct_txn      = len(ct)
             _ct_rev      = ct["Payment Price"].sum() if "Payment Price" in ct.columns else 0
@@ -3395,30 +3384,15 @@ with tab_txn:
             tk3.metric("Units Sold",   f"{_ct_qty:,.0f}")
             tk4.metric("Machines",     f"{_ct_machines}")
 
-            # ── Day-over-Day Comparison ───────────────────────────────────────────
-            if _ct_rev_day:
-                st.caption("Day-over-day: revenue (₹) / units sold")
-                _td1, _td2, _td3, _td4 = st.columns(4)
-                _td1.metric(
-                    f"D ({_ct_rev_day['D_date']})",
-                    f"₹{_ct_rev_day['D']:,.0f}  |  {_ct_qty_day.get('D', 0):,.0f} units",
-                    delta=_ct_delta(_ct_rev_day["D"], _ct_rev_day["D-1"], "₹"),
-                )
-                if _ct_rev_day["D-1"] is not None:
-                    _td2.metric(
-                        f"D-1 ({_ct_rev_day['D1_date']})",
-                        f"₹{_ct_rev_day['D-1']:,.0f}  |  {_ct_qty_day.get('D-1', 0) or 0:,.0f} units",
-                        delta=_ct_delta(_ct_rev_day["D-1"], _ct_rev_day["D-2"], "₹"),
-                    )
-                if _ct_rev_day["D-2"] is not None:
-                    _td3.metric(
-                        f"D-2 ({_ct_rev_day['D2_date']})",
-                        f"₹{_ct_rev_day['D-2']:,.0f}  |  {_ct_qty_day.get('D-2', 0) or 0:,.0f} units",
-                    )
-                _td4.metric(
-                    "Daily Avg",
-                    f"₹{_ct_rev_day['avg']:,.0f}  |  {_ct_qty_day.get('avg', 0) or 0:,.0f} units",
-                )
+            # ── Day-over-Day + Rolling Averages (D / D-1 / D-2 / D-3 / 3d / 7d / 15d) ──
+            if "date" in ct.columns and ct["date"].notna().any():
+                _ct_rev_daily = ct.groupby(ct["date"].dt.date)["Payment Price"].sum() if "Payment Price" in ct.columns else pd.Series(dtype=float)
+                _ct_qty_daily = ct.groupby(ct["date"].dt.date)["Quantity"].sum()      if "Quantity"      in ct.columns else pd.Series(dtype=float)
+                _ct_txn_daily = ct.groupby(ct["date"].dt.date).size()
+
+                snapshot_row("Daily Revenue (₹)", period_avgs(_ct_rev_daily), show_d3=True)
+                snapshot_row("Daily Units Sold", period_avgs(_ct_qty_daily), fmt="{:,.0f}", show_d3=True)
+                snapshot_row("Daily Transaction Count", period_avgs(_ct_txn_daily), fmt="{:,.0f}", show_d3=True)
 
             st.divider()
 
