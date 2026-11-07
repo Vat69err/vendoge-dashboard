@@ -195,6 +195,11 @@ manual redeploy step needed.
   machines stopped selling, dropped in revenue, or had elevated failures
   vs. their own trailing 30-day baseline — always anchored to the latest
   data, independent of the sidebar's date range
+- **Today tab:** Today vs. Yesterday, Last 3 Days, Last Week, This Month
+  and Last Month (shown as avg/day so every period is directly
+  comparable), at machine or location level, for revenue, units,
+  amount lost, or failure rate — plus This Month/Last Month revenue
+  totals
 - **Revenue & Sales tab:** daily revenue & units, revenue by hour of day,
   month-over-month trend (fleet-wide or drilled into one machine/
   location/warehouse), top products by revenue
