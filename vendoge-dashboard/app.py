@@ -456,10 +456,10 @@ LEVEL_LABELS = {"machine": "Machine", "location": "Location", "warehouse": "Ware
 # ============================================================
 # 6. TABS
 # ============================================================
-(tab_overview, tab_attention, tab_revenue, tab_refill, tab_failures, tab_sku, tab_machines,
- tab_outliers, tab_accounts, tab_hr) = st.tabs([
-    "📊 Overview", "🚨 Needs Attention", "💰 Revenue & Sales", "🔁 Refilling", "🚫 Failures",
-    "🧃 SKU Mix", "🖥️ Machines", "⚠️ Outliers", "💳 Accounts", "👥 HR",
+(tab_overview, tab_attention, tab_today, tab_revenue, tab_refill, tab_failures, tab_sku,
+ tab_machines, tab_outliers, tab_accounts, tab_hr) = st.tabs([
+    "📊 Overview", "🚨 Needs Attention", "📅 Today", "💰 Revenue & Sales", "🔁 Refilling",
+    "🚫 Failures", "🧃 SKU Mix", "🖥️ Machines", "⚠️ Outliers", "💳 Accounts", "👥 HR",
 ])
 
 # ---------- OVERVIEW ----------
@@ -677,6 +677,163 @@ with tab_attention:
             )
             fig_attn.update_layout(xaxis_title="Change vs Baseline (%)", yaxis_title="")
             st.plotly_chart(fig_attn, use_container_width=True)
+
+# ---------- TODAY ----------
+with tab_today:
+    st.subheader("📅 Today's Detail")
+    st.caption(
+        "Today vs. Yesterday, Last 3 Days, Last Week, This Month and Last Month — always "
+        "anchored to the latest data (City/Machine filters still apply). Multi-day periods "
+        "are shown as an average per day, so they're directly comparable to Today."
+    )
+
+    txn_daily_today_base = filter_dim(txn_daily_df)
+    latest_date = txn_daily_today_base["date"].max()
+
+    if pd.isna(latest_date):
+        st.info("No transaction data available for the current City/Machine filters.")
+    else:
+        yesterday = latest_date - pd.Timedelta(days=1)
+        last3_start = latest_date - pd.Timedelta(days=2)
+        lastweek_start = latest_date - pd.Timedelta(days=6)
+        month_start = latest_date.replace(day=1)
+        days_elapsed = (latest_date - month_start).days + 1
+        last_month_end = month_start - pd.Timedelta(days=1)
+        last_month_start = last_month_end.replace(day=1)
+        days_in_last_month = (last_month_end - last_month_start).days + 1
+
+        PERIODS = [
+            ("Today", latest_date, latest_date, 1),
+            ("Yesterday", yesterday, yesterday, 1),
+            ("Last 3 Days", last3_start, latest_date, 3),
+            ("Last Week", lastweek_start, latest_date, 7),
+            ("This Month", month_start, latest_date, days_elapsed),
+            ("Last Month", last_month_start, last_month_end, days_in_last_month),
+        ]
+        period_labels = [p[0] for p in PERIODS]
+
+        st.caption(
+            f"This Month = {month_start.date()} → {latest_date.date()} ({days_elapsed} day(s) so far, "
+            f"month-to-date). Last Month = {last_month_start.date()} → {last_month_end.date()} (full month)."
+        )
+
+        # ── Fleet-wide revenue snapshot across the six periods ──────────────
+        fleet_vals = {}
+        for label, start, end, days in PERIODS:
+            sub = txn_daily_today_base[(txn_daily_today_base["date"] >= start) & (txn_daily_today_base["date"] <= end)]
+            fleet_vals[label] = (sub["revenue"].sum() / days) if not sub.empty else 0.0
+
+        st.caption("**Avg Daily Revenue — Fleet (filtered)**")
+        fleet_cols = st.columns(6)
+        for col, label in zip(fleet_cols, period_labels):
+            val = fleet_vals[label]
+            if label == "Today":
+                col.metric(label, f"₹{val:,.0f}")
+            else:
+                delta = (fleet_vals["Today"] - val) / val * 100 if val else None
+                col.metric(label, f"₹{val:,.0f}", delta=f"{delta:+.1f}% vs Today" if delta is not None else None)
+
+        st.divider()
+
+        # ── Per-entity detail table ──────────────────────────────────────────
+        def _period_series(df, start, end, days, group_col, metric):
+            sub = df[(df["date"] >= start) & (df["date"] <= end)]
+            if sub.empty:
+                return pd.Series(dtype=float)
+            if metric == "failure_rate_pct":
+                grp = sub.groupby(group_col)
+                failure_rows = grp.apply(
+                    lambda g: g["dispense_timeout_rows"].sum() + g["paid_not_dispensed_rows"].sum()
+                              + g["payment_failed_rows"].sum()
+                )
+                rows_total = grp["rows_total"].sum()
+                return failure_rows / rows_total.replace(0, pd.NA) * 100
+            return sub.groupby(group_col)[metric].sum() / days
+
+        metric_options = {
+            "revenue": ("Revenue (₹)", "₹{:,.0f}"),
+            "sale_qty": ("Units Sold", "{:,.0f}"),
+            "paid_not_dispensed_amount": ("Amount Lost (₹)", "₹{:,.0f}"),
+            "failure_rate_pct": ("Failure Rate (%)", "{:.2f}%"),
+        }
+
+        td_c1, td_c2 = st.columns(2)
+        with td_c1:
+            td_level = st.radio(
+                "Level", ["machine", "location"], format_func=lambda k: k.title(),
+                horizontal=True, key="today_level",
+            )
+        with td_c2:
+            td_metric = st.selectbox(
+                "Metric", list(metric_options), format_func=lambda k: metric_options[k][0], key="today_metric"
+            )
+        metric_label, metric_fmt = metric_options[td_metric]
+        group_col = "machine_id" if td_level == "machine" else "location"
+
+        wide = pd.DataFrame({
+            label: _period_series(txn_daily_today_base, start, end, days, group_col, td_metric)
+            for label, start, end, days in PERIODS
+        })
+
+        if td_level == "machine":
+            base_entities = machines_f[["machine_id", "machine_name", "city", "location"]].drop_duplicates()
+            id_cols = ["machine_name", "city", "location"]
+            rename_id = {"machine_name": "Machine", "city": "City", "location": "Location"}
+        else:
+            base_entities = machines_f[["location", "city"]].drop_duplicates()
+            id_cols = ["location", "city"]
+            rename_id = {"location": "Location", "city": "City"}
+
+        table = base_entities.merge(wide, left_on=group_col, right_index=True, how="left")
+        for col in period_labels:
+            if col not in table.columns:
+                table[col] = pd.NA
+            if td_metric != "failure_rate_pct":
+                table[col] = table[col].fillna(0)
+
+        table["Δ Today vs Last Week %"] = (
+            (table["Today"] - table["Last Week"]) / table["Last Week"].replace(0, pd.NA) * 100
+        )
+        table = table.sort_values("Today", ascending=False)
+
+        display = table[id_cols + period_labels + ["Δ Today vs Last Week %"]].rename(columns=rename_id)
+        for col in period_labels:
+            display[col] = display[col].map(lambda v: metric_fmt.format(v) if pd.notna(v) else "—")
+        display["Δ Today vs Last Week %"] = display["Δ Today vs Last Week %"].map(
+            lambda v: f"{v:+.1f}%" if pd.notna(v) else "—"
+        )
+
+        st.subheader(f"{metric_label} — {td_level.title()} Level")
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        st.subheader("Month Totals")
+        st.caption(
+            "Raw revenue totals (not averaged per day). This Month is month-to-date, so its "
+            "MoM% isn't apples-to-apples with the full prior month until the month closes."
+        )
+        month_wide = pd.DataFrame({
+            "This Month Total": txn_daily_today_base[
+                (txn_daily_today_base["date"] >= month_start) & (txn_daily_today_base["date"] <= latest_date)
+            ].groupby(group_col)["revenue"].sum(),
+            "Last Month Total": txn_daily_today_base[
+                (txn_daily_today_base["date"] >= last_month_start) & (txn_daily_today_base["date"] <= last_month_end)
+            ].groupby(group_col)["revenue"].sum(),
+        })
+        month_table = base_entities.merge(month_wide, left_on=group_col, right_index=True, how="left")
+        for col in ("This Month Total", "Last Month Total"):
+            month_table[col] = month_table[col].fillna(0)
+        month_table["MoM %"] = (
+            (month_table["This Month Total"] - month_table["Last Month Total"])
+            / month_table["Last Month Total"].replace(0, pd.NA) * 100
+        )
+        month_table = month_table.sort_values("This Month Total", ascending=False)
+        month_display = month_table[id_cols + ["This Month Total", "Last Month Total", "MoM %"]].rename(columns=rename_id)
+        month_display["This Month Total"] = month_display["This Month Total"].map(lambda v: f"₹{v:,.0f}")
+        month_display["Last Month Total"] = month_display["Last Month Total"].map(lambda v: f"₹{v:,.0f}")
+        month_display["MoM %"] = month_display["MoM %"].map(lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
+        st.dataframe(month_display, use_container_width=True, hide_index=True)
 
 # ---------- REVENUE & SALES ----------
 with tab_revenue:
