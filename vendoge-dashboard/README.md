@@ -1,8 +1,8 @@
 # Vendoge Operations Dashboard
 
 A Streamlit dashboard that reads live data straight from your Google Sheet
-(no manual exports, no re-uploading files) and shows sales, refilling, and
-stock-out trends across your machines.
+(no manual exports, no re-uploading files) and shows revenue, refilling, SKU
+mix, and dispense-failure trends across your machines.
 
 This guide assumes you've never deployed a Streamlit app before. Follow it
 top to bottom.
@@ -16,17 +16,21 @@ top to bottom.
 - `.gitignore` — tells git which files to ignore
 
 Because your Google Sheet is **public** ("Anyone with the link can view"),
-the app reads it directly as a CSV export — no Google API keys, no service
-account, no secrets file needed. This is the simplest possible setup.
+the app reads each tab directly as a CSV export by name — no Google API
+keys, no service account, no gids to configure. This is the simplest
+possible setup.
 
 ---
 
 ## 1. Point the app at your sheet
 
-Open `app.py` and find this line near the top:
+The app needs your Google Sheet's ID set up in Streamlit secrets — locally
+in `.streamlit/secrets.toml`, or on Streamlit Cloud under your app's
+Settings → Secrets:
 
-```python
-SHEET_ID = "PASTE_YOUR_GOOGLE_SHEET_ID_HERE"
+```toml
+[sheets]
+dashboard = "PASTE_YOUR_GOOGLE_SHEET_ID_HERE"
 ```
 
 Your Sheet ID is the long string in your sheet's URL:
@@ -35,20 +39,40 @@ Your Sheet ID is the long string in your sheet's URL:
 https://docs.google.com/spreadsheets/d/  1AbCxyz123_THIS_IS_YOUR_ID  /edit
 ```
 
-Copy that middle part and paste it in, e.g.:
+**Important:** the app expects these tabs to exist, named exactly:
+- `Machines`
+- `Warehouse_Products`
+- `Txn_Daily`
+- `Txn_Hourly`
+- `Txn_Failures`
+- `Txn_Product`
+- `Metrics_Summary`
+- `Rev_DoD`
+- `Rev_MoM`
+- `Refill_Hourly`
+- `Refill_Product` (optional — a per-product refill breakdown shows up once this has rows)
+- `SKU_Category_Map`
+- `SKU_Mix`
 
-```python
-SHEET_ID = "1AbCxyz123_THIS_IS_YOUR_ID"
+Tabs are matched by name, not position, so you can reorder them freely in
+the sheet.
+
+### Optional: Accounts / HR tabs
+
+The **Accounts** and **HR** tabs are unrelated to the vending-sales sheet
+above — they read a separate bank/ledger sheet. If you use them, add:
+
+```toml
+[sheets]
+dashboard = "..."
+accounts = "PASTE_YOUR_ACCOUNTS_SHEET_ID_HERE"
+
+[gids.accounts]
+accounts = "PASTE_THE_ACCOUNTS_TAB_GID_HERE"
 ```
 
-**Important:** the app expects your tabs to be named exactly:
-- `Machine Wise Sales`
-- `Consolidated Refilling`
-- `Out of Stock Log`
-
-If your real tab names differ even slightly (extra space, different
-capitalization), update the `TABS` dictionary right below `SHEET_ID` to
-match.
+(Find the gid in that tab's URL, after `#gid=`.) Leave these out and the
+Accounts/HR tabs will just show an info message instead of erroring.
 
 ---
 
@@ -66,7 +90,8 @@ anything that looks wrong here before deploying — it's much faster to
 debug locally than on the cloud.
 
 If you get an error loading the sheet, check:
-- Is `SHEET_ID` actually pasted in (not left as the placeholder)?
+- Is `dashboard` under `[sheets]` in your secrets actually set to your real
+  sheet ID (not left as the placeholder)?
 - Is the sheet really shared as "Anyone with the link → Viewer"? (Share
   button, top-right of Google Sheets)
 - Do the tab names match exactly?
@@ -160,17 +185,30 @@ manual redeploy step needed.
 
 ## What's in the dashboard
 
-- **Sidebar:** date range picker, machine filter, manual refresh button
-- **KPI row:** total sales, units sold, average daily sales, cash share,
-  stock-out count — all respect the filters above
-- **Overview tab:** daily sales trend, machine split, top products, sales
-  by category
-- **Machine Sales tab:** brand/category filters, per-machine trend lines,
-  cash vs. cashless breakdown, full product-level table
-- **Refilling tab:** refill value by refiller, units refilled per day,
-  full refill log
-- **Stock-Outs tab:** events per day per machine, most frequently
-  out-of-stock products, cash vs. cashless stock-out split, full log
+- **Sidebar:** date range picker, city filter, machine filter, manual
+  refresh button
+- **KPI row:** total revenue, units sold, average daily revenue, machines
+  in view, failure rate — all respect the filters above
+- **Overview tab:** D/D-1/D-2/average daily-revenue snapshot, daily revenue
+  trend, lifetime top-performer leaderboard (by machine/location/warehouse)
+- **Revenue & Sales tab:** daily revenue & units, revenue by hour of day,
+  month-over-month trend (fleet-wide or drilled into one machine/
+  location/warehouse), top products by revenue
+- **Refilling tab:** refill quantity by hour of day, refill totals by
+  machine
+- **Failures tab:** dispense-timeout/paid-not-dispensed/payment-failed
+  KPIs, amount lost over time and by machine, detailed monthly breakdown
+  by error code
+- **SKU Mix tab:** fleet-wide revenue by category, top products, and a
+  category revenue-share breakdown per machine/location/warehouse (all
+  time or last full month)
+- **Machines tab:** machine directory with status/city/location/
+  warehouse, machine counts by city, lifetime performance leaderboard
+- **Accounts tab:** bank ledger KPIs, P&L snapshot and waterfall, cash
+  flow analytics, full transaction log — reads the separate accounts
+  sheet (see "Optional: Accounts / HR tabs" above)
+- **HR tab:** payroll detected from the Accounts ledger — per-employee
+  totals, monthly payroll trend, full payment history
 
 ---
 
