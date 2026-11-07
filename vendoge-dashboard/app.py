@@ -433,15 +433,33 @@ def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}", inverse: bool 
     c7.metric("Overall Avg/Day", fmt.format(avgs["avg_all"]))
 
 
+def _iqr_bounds(s: pd.Series):
+    """Tukey's fences: outside these bounds counts as an outlier."""
+    s = s.dropna()
+    if len(s) < 4:
+        return None, None
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    iqr = q3 - q1
+    return q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+
+def _flag(v, lower, upper):
+    if v > upper:
+        return "🔴 High"
+    if v < lower:
+        return "🔵 Low"
+    return ""
+
+
 LEVEL_LABELS = {"machine": "Machine", "location": "Location", "warehouse": "Warehouse"}
 
 # ============================================================
 # 6. TABS
 # ============================================================
-(tab_overview, tab_revenue, tab_refill, tab_failures, tab_sku, tab_machines,
+(tab_overview, tab_attention, tab_revenue, tab_refill, tab_failures, tab_sku, tab_machines,
  tab_outliers, tab_accounts, tab_hr) = st.tabs([
-    "📊 Overview", "💰 Revenue & Sales", "🔁 Refilling", "🚫 Failures", "🧃 SKU Mix",
-    "🖥️ Machines", "⚠️ Outliers", "💳 Accounts", "👥 HR",
+    "📊 Overview", "🚨 Needs Attention", "💰 Revenue & Sales", "🔁 Refilling", "🚫 Failures",
+    "🧃 SKU Mix", "🖥️ Machines", "⚠️ Outliers", "💳 Accounts", "👥 HR",
 ])
 
 # ---------- OVERVIEW ----------
@@ -497,6 +515,168 @@ with tab_overview:
             )
             fig_top.update_layout(xaxis_title=metric_options[tp_metric], yaxis_title="")
             st.plotly_chart(fig_top, use_container_width=True)
+
+# ---------- NEEDS ATTENTION ----------
+with tab_attention:
+    st.subheader("🚨 Needs Attention")
+    st.caption(
+        "Per-machine health check over the most recent days of data, regardless of the "
+        "date range picked in the sidebar (City/Machine filters still apply). Compares each "
+        "machine's recent average to its own trailing 30-day baseline."
+    )
+
+    txn_daily_recent = filter_dim(txn_daily_df)
+    latest_date = txn_daily_recent["date"].max()
+
+    if pd.isna(latest_date):
+        st.info("No transaction data available for the current City/Machine filters.")
+    else:
+        n_days = st.radio(
+            "Look back", [1, 2, 3, 4, 5],
+            format_func=lambda n: f"Last {n} day" + ("s" if n > 1 else ""),
+            index=2, horizontal=True, key="attn_days",
+        )
+        window_start = latest_date - pd.Timedelta(days=n_days - 1)
+        baseline_end = window_start - pd.Timedelta(days=1)
+        baseline_start = baseline_end - pd.Timedelta(days=29)
+
+        st.caption(
+            f"Window: **{window_start.date()} → {latest_date.date()}** vs. baseline "
+            f"**{baseline_start.date()} → {baseline_end.date()}** (trailing 30 days before the window)."
+        )
+
+        window_df = txn_daily_recent[
+            (txn_daily_recent["date"] >= window_start) & (txn_daily_recent["date"] <= latest_date)
+        ].copy()
+        baseline_df = txn_daily_recent[
+            (txn_daily_recent["date"] >= baseline_start) & (txn_daily_recent["date"] <= baseline_end)
+        ].copy()
+
+        for _df in (window_df, baseline_df):
+            _df["failure_rows"] = (
+                _df["dispense_timeout_rows"] + _df["paid_not_dispensed_rows"] + _df["payment_failed_rows"]
+            )
+
+        # ── Fleet-level KPIs ─────────────────────────────────────────────────
+        win_revenue = window_df["revenue"].sum()
+        win_avg_daily = win_revenue / n_days
+        base_avg_daily = (
+            baseline_df.groupby(baseline_df["date"].dt.date)["revenue"].sum().mean()
+            if not baseline_df.empty else 0.0
+        )
+        win_failure_rate = (
+            window_df["failure_rows"].sum() / window_df["rows_total"].sum() * 100
+            if window_df["rows_total"].sum() else 0.0
+        )
+        win_rows_total = window_df["rows_total"].sum()
+        base_rows_total = baseline_df["rows_total"].sum()
+        base_failure_rate = (
+            baseline_df["failure_rows"].sum() / base_rows_total * 100 if base_rows_total else 0.0
+        )
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(f"Revenue, Last {n_days}d", f"₹{win_revenue:,.0f}")
+        rev_delta = (win_avg_daily - base_avg_daily) / base_avg_daily * 100 if base_avg_daily else None
+        k2.metric(
+            "Avg Daily Revenue", f"₹{win_avg_daily:,.0f}",
+            delta=f"{rev_delta:+.1f}% vs trailing 30d" if rev_delta is not None else None,
+        )
+        k3.metric(
+            "Failure Rate", f"{win_failure_rate:.2f}%",
+            delta=f"{win_failure_rate - base_failure_rate:+.2f}pp vs trailing 30d" if base_rows_total else None,
+            delta_color="inverse",
+        )
+        k4.metric("Machines With Sales", f"{window_df.loc[window_df['revenue'] > 0, 'machine_id'].nunique():,}")
+
+        st.divider()
+
+        # ── Per-machine window vs. baseline ─────────────────────────────────
+        win_agg = window_df.groupby("machine_id", as_index=False).agg(
+            revenue_window=("revenue", "sum"),
+            units_window=("sale_qty", "sum"),
+            rows_total_window=("rows_total", "sum"),
+            failure_rows_window=("failure_rows", "sum"),
+            lost_amount_window=("paid_not_dispensed_amount", "sum"),
+        )
+        base_agg = baseline_df.groupby("machine_id", as_index=False).agg(
+            baseline_avg_daily_revenue=("revenue", "mean"),
+        )
+
+        attn = machines_f.merge(win_agg, on="machine_id", how="left")
+        attn = attn.merge(base_agg, on="machine_id", how="left")
+        for _col in ("revenue_window", "units_window", "rows_total_window", "failure_rows_window", "lost_amount_window"):
+            attn[_col] = attn[_col].fillna(0)
+
+        attn["avg_daily_window"] = attn["revenue_window"] / n_days
+        attn["failure_rate_window_pct"] = (
+            attn["failure_rows_window"] / attn["rows_total_window"].replace(0, pd.NA) * 100
+        )
+        attn["revenue_change_pct"] = (
+            (attn["avg_daily_window"] - attn["baseline_avg_daily_revenue"])
+            / attn["baseline_avg_daily_revenue"].replace(0, pd.NA) * 100
+        )
+        attn["no_sales"] = (attn["revenue_window"] == 0) & (attn["baseline_avg_daily_revenue"].fillna(0) > 0)
+
+        # IQR fences on the non-zero-sales subset, so a "No Sales" machine (already
+        # its own -100% flag) doesn't skew the fence used for partial declines.
+        lower_rev, upper_rev = _iqr_bounds(attn.loc[~attn["no_sales"], "revenue_change_pct"])
+        lower_fail, upper_fail = _iqr_bounds(attn.loc[attn["rows_total_window"] > 0, "failure_rate_window_pct"])
+
+        def _attn_flags(row):
+            flags = []
+            if row["no_sales"]:
+                flags.append("🔴 No Sales")
+            elif lower_rev is not None and pd.notna(row["revenue_change_pct"]) and row["revenue_change_pct"] < lower_rev:
+                flags.append("📉 Revenue Drop")
+            if (not row["no_sales"] and upper_fail is not None
+                    and pd.notna(row["failure_rate_window_pct"]) and row["failure_rate_window_pct"] > upper_fail):
+                flags.append("⚠️ High Failures")
+            return flags
+
+        attn["flags"] = attn.apply(_attn_flags, axis=1)
+        attn["flag_count"] = attn["flags"].apply(len)
+        flagged = attn[attn["flag_count"] > 0].sort_values(
+            ["flag_count", "revenue_change_pct"], ascending=[False, True]
+        )
+
+        st.subheader("Attention List")
+        if flagged.empty:
+            st.success(f"No machines flagged in the last {n_days} day(s).")
+        else:
+            display = flagged.copy()
+            display["Flags"] = display["flags"].apply(lambda fl: ", ".join(fl))
+            st.dataframe(
+                display[[
+                    "machine_name", "city", "location", "Flags", "revenue_window",
+                    "revenue_change_pct", "failure_rate_window_pct", "lost_amount_window",
+                ]].rename(columns={
+                    "machine_name": "Machine", "city": "City", "location": "Location",
+                    "revenue_window": f"Revenue (Last {n_days}d)", "revenue_change_pct": "vs Baseline %",
+                    "failure_rate_window_pct": "Failure Rate %", "lost_amount_window": "Amount Lost",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+        st.divider()
+
+        st.subheader("Revenue Change vs Trailing 30-Day Baseline")
+        chart_df = attn.dropna(subset=["revenue_change_pct"]).copy()
+        if chart_df.empty:
+            st.info("Not enough baseline history yet to compare.")
+        else:
+            chart_df["status"] = chart_df.apply(
+                lambda r: "No Sales" if r["no_sales"] else ("Flagged" if r["flag_count"] > 0 else "Normal"),
+                axis=1,
+            )
+            fig_attn = px.bar(
+                chart_df.sort_values("revenue_change_pct"), x="revenue_change_pct", y="machine_name",
+                orientation="h", color="status",
+                color_discrete_map={"No Sales": "#B85C5C", "Flagged": ACCENT, "Normal": PRIMARY},
+                title=f"Avg Daily Revenue, Last {n_days}d vs Trailing 30-Day Baseline",
+                height=max(420, len(chart_df) * 22),
+            )
+            fig_attn.update_layout(xaxis_title="Change vs Baseline (%)", yaxis_title="")
+            st.plotly_chart(fig_attn, use_container_width=True)
 
 # ---------- REVENUE & SALES ----------
 with tab_revenue:
@@ -834,21 +1014,6 @@ with tab_outliers:
         "Machines that stand out from the fleet — flagged with the IQR rule "
         "(outside Q1/Q3 ± 1.5×IQR), the same convention boxplots use to mark outliers."
     )
-
-    def _iqr_bounds(s: pd.Series):
-        s = s.dropna()
-        if len(s) < 4:
-            return None, None
-        q1, q3 = s.quantile(0.25), s.quantile(0.75)
-        iqr = q3 - q1
-        return q1 - 1.5 * iqr, q3 + 1.5 * iqr
-
-    def _flag(v, lower, upper):
-        if v > upper:
-            return "🔴 High"
-        if v < lower:
-            return "🔵 Low"
-        return ""
 
     metrics_df = data["metrics_summary"]
     metrics_machine = metrics_df[metrics_df["level"] == "machine"].rename(columns={"entity": "machine_id"})

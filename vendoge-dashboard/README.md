@@ -191,6 +191,10 @@ manual redeploy step needed.
   in view, failure rate — all respect the filters above
 - **Overview tab:** D/D-1/D-2/average daily-revenue snapshot, daily revenue
   trend, lifetime top-performer leaderboard (by machine/location/warehouse)
+- **Needs Attention tab:** pick a 1-5 day lookback window and see which
+  machines stopped selling, dropped in revenue, or had elevated failures
+  vs. their own trailing 30-day baseline — always anchored to the latest
+  data, independent of the sidebar's date range
 - **Revenue & Sales tab:** daily revenue & units, revenue by hour of day,
   month-over-month trend (fleet-wide or drilled into one machine/
   location/warehouse), top products by revenue
