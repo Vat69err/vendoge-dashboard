@@ -204,6 +204,10 @@ manual redeploy step needed.
   time or last full month)
 - **Machines tab:** machine directory with status/city/location/
   warehouse, machine counts by city, lifetime performance leaderboard
+- **Outliers tab:** machines flagged by the IQR rule on a chosen metric
+  (revenue, failure rate, amount lost, recent revenue momentum), plus
+  the most volatile machines by day-to-day revenue and machines with an
+  unusually high/low share of a product category
 - **Accounts tab:** bank ledger KPIs, P&L snapshot and waterfall, cash
   flow analytics, full transaction log — reads the separate accounts
   sheet (see "Optional: Accounts / HR tabs" above)

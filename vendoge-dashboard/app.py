@@ -439,9 +439,9 @@ LEVEL_LABELS = {"machine": "Machine", "location": "Location", "warehouse": "Ware
 # 6. TABS
 # ============================================================
 (tab_overview, tab_revenue, tab_refill, tab_failures, tab_sku, tab_machines,
- tab_accounts, tab_hr) = st.tabs([
+ tab_outliers, tab_accounts, tab_hr) = st.tabs([
     "📊 Overview", "💰 Revenue & Sales", "🔁 Refilling", "🚫 Failures", "🧃 SKU Mix",
-    "🖥️ Machines", "💳 Accounts", "👥 HR",
+    "🖥️ Machines", "⚠️ Outliers", "💳 Accounts", "👥 HR",
 ])
 
 # ---------- OVERVIEW ----------
@@ -826,6 +826,153 @@ with tab_machines:
             }),
             use_container_width=True, hide_index=True,
         )
+
+# ---------- OUTLIERS ----------
+with tab_outliers:
+    st.subheader("⚠️ Outlier Machines")
+    st.caption(
+        "Machines that stand out from the fleet — flagged with the IQR rule "
+        "(outside Q1/Q3 ± 1.5×IQR), the same convention boxplots use to mark outliers."
+    )
+
+    def _iqr_bounds(s: pd.Series):
+        s = s.dropna()
+        if len(s) < 4:
+            return None, None
+        q1, q3 = s.quantile(0.25), s.quantile(0.75)
+        iqr = q3 - q1
+        return q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+    def _flag(v, lower, upper):
+        if v > upper:
+            return "🔴 High"
+        if v < lower:
+            return "🔵 Low"
+        return ""
+
+    metrics_df = data["metrics_summary"]
+    metrics_machine = metrics_df[metrics_df["level"] == "machine"].rename(columns={"entity": "machine_id"})
+    metrics_machine = metrics_machine.merge(
+        machines_f[["machine_id", "machine_name", "city", "location"]], on="machine_id", how="inner"
+    )
+    if not metrics_machine.empty:
+        metrics_machine["revenue_momentum_pct"] = (
+            (metrics_machine["avg_last_7d_revenue"] - metrics_machine["avg_last_30d_revenue"])
+            / metrics_machine["avg_last_30d_revenue"].replace(0, pd.NA) * 100
+        )
+
+    st.subheader("By Metric")
+    if metrics_machine.empty:
+        st.info("No machines with `Metrics_Summary` data for the current filters.")
+    else:
+        metric_options = {
+            "total_revenue": "Total Revenue (₹)",
+            "mean_daily_revenue": "Avg Daily Revenue (₹)",
+            "failure_rate_pct": "Failure Rate (%)",
+            "failed_amount_paid_not_dispensed": "Amount Lost — Paid Not Dispensed (₹)",
+            "revenue_momentum_pct": "Revenue Momentum — Last 7d vs Last 30d (%)",
+        }
+        out_metric = st.selectbox(
+            "Metric", list(metric_options), format_func=lambda k: metric_options[k], key="out_metric"
+        )
+        vals = metrics_machine[["machine_name", "city", "location", out_metric]].dropna(subset=[out_metric])
+        lower, upper = _iqr_bounds(vals[out_metric])
+        if lower is None:
+            st.info("Not enough machines with data for this metric to detect outliers.")
+        else:
+            vals = vals.copy()
+            vals["flag"] = vals[out_metric].apply(lambda v: _flag(v, lower, upper))
+            outliers = vals[vals["flag"] != ""].sort_values(out_metric, ascending=False)
+
+            fig_box = px.box(
+                vals, y=out_metric, points="all", hover_data=["machine_name", "city"],
+                title=f"{metric_options[out_metric]} — Distribution Across Machines",
+                color_discrete_sequence=[PRIMARY],
+            )
+            fig_box.update_layout(yaxis_title=metric_options[out_metric])
+            st.plotly_chart(fig_box, use_container_width=True)
+
+            if outliers.empty:
+                st.success("No outlier machines detected for this metric.")
+            else:
+                st.caption(f"Fleet median: {vals[out_metric].median():,.2f} · fence: [{lower:,.2f}, {upper:,.2f}]")
+                st.dataframe(
+                    outliers.rename(columns={
+                        "machine_name": "Machine", "city": "City", "location": "Location",
+                        out_metric: metric_options[out_metric], "flag": "Flag",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+
+    st.divider()
+
+    st.subheader("📉 Revenue Volatility")
+    st.caption(
+        "Coefficient of variation (std ÷ mean) of daily revenue per machine, over the date range above — "
+        "higher means more erratic day-to-day sales."
+    )
+    daily_by_machine = (
+        txn_daily_f.groupby(["machine_id", "machine_name"])["revenue"]
+        .agg(["mean", "std", "count"]).reset_index()
+    )
+    daily_by_machine = daily_by_machine[daily_by_machine["count"] >= 5]
+    if daily_by_machine.empty:
+        st.info("Not enough days of data in the current filters to measure volatility.")
+    else:
+        daily_by_machine["cv_pct"] = (
+            daily_by_machine["std"] / daily_by_machine["mean"].replace(0, pd.NA) * 100
+        )
+        top_volatile = daily_by_machine.dropna(subset=["cv_pct"]).sort_values("cv_pct", ascending=False).head(10)
+        fig_cv = px.bar(
+            top_volatile.sort_values("cv_pct"), x="cv_pct", y="machine_name", orientation="h",
+            title="Most Volatile Machines (Daily Revenue)", color_discrete_sequence=[ACCENT],
+        )
+        fig_cv.update_layout(xaxis_title="Coefficient of Variation (%)", yaxis_title="")
+        st.plotly_chart(fig_cv, use_container_width=True)
+
+    st.divider()
+
+    st.subheader("🧃 Category Mix Outliers")
+    st.caption(
+        "Machines whose revenue share of a product category is unusually high or low vs. the "
+        "fleet (All Time)."
+    )
+    sku_mix_df = data["sku_mix"]
+    mix_machine = sku_mix_df[(sku_mix_df["level"] == "machine") & (sku_mix_df["scope_kind"] == "all_time")]
+    mix_machine = mix_machine[mix_machine["label"].isin(machines_f["machine_name"])]
+    if mix_machine.empty:
+        st.info("No `SKU_Mix` data at machine level for the current filters.")
+    else:
+        cat_choice = st.selectbox(
+            "Category", sorted(mix_machine["category_group"].dropna().unique().tolist()), key="out_cat"
+        )
+        cat_rows = mix_machine[mix_machine["category_group"] == cat_choice]
+        lower_c, upper_c = _iqr_bounds(cat_rows["revenue_share_pct"])
+        if lower_c is None:
+            st.info("Not enough machines selling this category to detect outliers.")
+        else:
+            cat_rows = cat_rows.copy()
+            cat_rows["flag"] = cat_rows["revenue_share_pct"].apply(lambda v: _flag(v, lower_c, upper_c))
+            cat_outliers = cat_rows[cat_rows["flag"] != ""].sort_values("revenue_share_pct", ascending=False)
+
+            fig_cat_box = px.box(
+                cat_rows, y="revenue_share_pct", points="all", hover_data=["label"],
+                title=f"{cat_choice} — Revenue Share Across Machines", color_discrete_sequence=[PRIMARY],
+            )
+            fig_cat_box.update_layout(yaxis_title="Revenue Share %")
+            st.plotly_chart(fig_cat_box, use_container_width=True)
+
+            if cat_outliers.empty:
+                st.success("No outlier machines for this category.")
+            else:
+                st.caption(f"Fleet median share: {cat_rows['revenue_share_pct'].median():.1f}%")
+                st.dataframe(
+                    cat_outliers[["label", "revenue_share_pct", "sold_qty", "flag"]].rename(columns={
+                        "label": "Machine", "revenue_share_pct": "Revenue Share %",
+                        "sold_qty": "Units Sold", "flag": "Flag",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
 
 with tab_accounts:
     st.subheader("💳 Accounts Ledger")
