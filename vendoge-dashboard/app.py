@@ -334,11 +334,48 @@ txn_failures_f = filter_month_overlap(filter_dim(data["txn_failures"]))
 txn_product_f = filter_month_overlap(filter_dim(data["txn_product"]))
 refill_hourly_f = filter_month_overlap(filter_dim(data["refill_hourly"]))
 
+
+# ── Is "today" still in progress? ───────────────────────────────────────────
+# If the latest date in the data is also the server's current calendar date,
+# that day's totals are a partial day, not a finished one — comparing a
+# partial Today straight against a full Yesterday (or a full-day average)
+# understates Today by however much of the day is still left to come in.
+def _hour_of_day_pattern(hourly_df: pd.DataFrame, as_of_month_start) -> pd.Series:
+    """Revenue by hour-of-day (0-23), preferring the current month's pattern and
+    falling back to all available history if the current month has too little data."""
+    recent = hourly_df[hourly_df["month"] >= as_of_month_start]
+    src = recent if not recent.empty and recent["revenue"].sum() > 0 else hourly_df
+    return src.groupby("hour")["revenue"].sum().reindex(range(24), fill_value=0)
+
+
+def _elapsed_day_fraction(latest_date, hourly_df):
+    """(is_partial, fraction_of_a_typical_day_elapsed_by_now, now)."""
+    now = pd.Timestamp.now()
+    if pd.isna(latest_date) or latest_date.date() != now.date():
+        return False, 1.0, now
+    totals = _hour_of_day_pattern(hourly_df, latest_date.replace(day=1))
+    total = totals.sum()
+    fraction = (totals[totals.index < now.hour].sum() / total) if total > 0 else (now.hour / 24)
+    return True, max(fraction, 0.02), now
+
+
+_latest_data_date = filter_dim(txn_daily_df)["date"].max()
+_hourly_pattern_base = filter_dim(data["txn_hourly"])
+IS_TODAY_PARTIAL, DAY_ELAPSED_FRACTION, NOW_TS = _elapsed_day_fraction(_latest_data_date, _hourly_pattern_base)
+
 # ============================================================
 # 4. HEADER + KPI ROW
 # ============================================================
 st.title("Vendoge Operations Dashboard")
 st.caption("Live view of machine revenue, refilling, and dispense-failure trends across the fleet.")
+
+if IS_TODAY_PARTIAL:
+    st.info(
+        f"⏱️ Today's data is still coming in — as of {NOW_TS.strftime('%I:%M %p')}, about "
+        f"{DAY_ELAPSED_FRACTION * 100:.0f}% of a typical day has usually elapsed by now "
+        "(based on recent hour-of-day patterns). Comparisons involving Today are pace-adjusted "
+        "to this point in the day where shown, instead of against a full day."
+    )
 
 total_revenue = txn_daily_f["revenue"].sum()
 total_units = txn_daily_f["sale_qty"].sum()
@@ -402,8 +439,13 @@ def period_avgs(daily_series: pd.Series) -> dict:
     }
 
 
-def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}", inverse: bool = False):
-    """Render a labelled 7-column snapshot strip with delta arrows."""
+def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}", inverse: bool = False, pace_fraction: float = 1.0):
+    """
+    Render a labelled 7-column snapshot strip with delta arrows.
+    `pace_fraction` < 1 means the latest day is still in progress: the Latest-vs-D−1
+    delta compares against D−1 scaled down to that same point in the day, instead of
+    against a full finished day.
+    """
     def _delta(a, b):
         diff = a - b
         if b == 0:
@@ -416,7 +458,7 @@ def snapshot_row(label: str, avgs: dict, fmt: str = "₹{:,.0f}", inverse: bool 
         d = avgs.get(key)
         return d.strftime("%-d %b") if d else "—"
 
-    d_lat, col_lat = _delta(avgs["latest"], avgs["day_m1"])
+    d_lat, col_lat = _delta(avgs["latest"], avgs["day_m1"] * pace_fraction)
     d_m1, col_m1 = _delta(avgs["day_m1"], avgs["day_m2"])
     d_3v7, col_3v7 = _delta(avgs["avg_3d"], avgs["avg_7d"])
     d_7v15, col_7v15 = _delta(avgs["avg_7d"], avgs["avg_15d"])
@@ -469,7 +511,10 @@ with tab_overview:
 
     daily_rev = txn_daily_f.groupby(txn_daily_f["date"].dt.date)["revenue"].sum()
     daily_rev.index = pd.to_datetime(daily_rev.index)
-    snapshot_row("Daily Revenue", period_avgs(daily_rev), fmt="₹{:,.0f}")
+    snapshot_row(
+        "Daily Revenue", period_avgs(daily_rev), fmt="₹{:,.0f}",
+        pace_fraction=DAY_ELAPSED_FRACTION if IS_TODAY_PARTIAL else 1.0,
+    )
 
     st.divider()
 
@@ -545,6 +590,12 @@ with tab_attention:
             f"**{baseline_start.date()} → {baseline_end.date()}** (trailing 30 days before the window)."
         )
 
+        # When the window's last day (today) is still partial, treat it as a fraction of a
+        # day rather than a full one when averaging — otherwise a 1-day window would compare
+        # a few hours of sales against a 30-day *daily* average and look like a huge drop.
+        effective_window_days = (n_days - 1 + DAY_ELAPSED_FRACTION) if IS_TODAY_PARTIAL else n_days
+        too_early_for_1day = n_days == 1 and IS_TODAY_PARTIAL and DAY_ELAPSED_FRACTION < 0.15
+
         window_df = txn_daily_recent[
             (txn_daily_recent["date"] >= window_start) & (txn_daily_recent["date"] <= latest_date)
         ].copy()
@@ -559,7 +610,7 @@ with tab_attention:
 
         # ── Fleet-level KPIs ─────────────────────────────────────────────────
         win_revenue = window_df["revenue"].sum()
-        win_avg_daily = win_revenue / n_days
+        win_avg_daily = win_revenue / effective_window_days
         base_avg_daily = (
             baseline_df.groupby(baseline_df["date"].dt.date)["revenue"].sum().mean()
             if not baseline_df.empty else 0.0
@@ -578,7 +629,7 @@ with tab_attention:
         k1.metric(f"Revenue, Last {n_days}d", f"₹{win_revenue:,.0f}")
         rev_delta = (win_avg_daily - base_avg_daily) / base_avg_daily * 100 if base_avg_daily else None
         k2.metric(
-            "Avg Daily Revenue", f"₹{win_avg_daily:,.0f}",
+            "Avg Daily Revenue" + (" (Pace-Adj.)" if IS_TODAY_PARTIAL else ""), f"₹{win_avg_daily:,.0f}",
             delta=f"{rev_delta:+.1f}% vs trailing 30d" if rev_delta is not None else None,
         )
         k3.metric(
@@ -607,7 +658,7 @@ with tab_attention:
         for _col in ("revenue_window", "units_window", "rows_total_window", "failure_rows_window", "lost_amount_window"):
             attn[_col] = attn[_col].fillna(0)
 
-        attn["avg_daily_window"] = attn["revenue_window"] / n_days
+        attn["avg_daily_window"] = attn["revenue_window"] / effective_window_days
         attn["failure_rate_window_pct"] = (
             attn["failure_rows_window"] / attn["rows_total_window"].replace(0, pd.NA) * 100
         )
@@ -615,7 +666,10 @@ with tab_attention:
             (attn["avg_daily_window"] - attn["baseline_avg_daily_revenue"])
             / attn["baseline_avg_daily_revenue"].replace(0, pd.NA) * 100
         )
-        attn["no_sales"] = (attn["revenue_window"] == 0) & (attn["baseline_avg_daily_revenue"].fillna(0) > 0)
+        if too_early_for_1day:
+            attn["no_sales"] = False
+        else:
+            attn["no_sales"] = (attn["revenue_window"] == 0) & (attn["baseline_avg_daily_revenue"].fillna(0) > 0)
 
         # IQR fences on the non-zero-sales subset, so a "No Sales" machine (already
         # its own -100% flag) doesn't skew the fence used for partial declines.
@@ -626,7 +680,8 @@ with tab_attention:
             flags = []
             if row["no_sales"]:
                 flags.append("🔴 No Sales")
-            elif lower_rev is not None and pd.notna(row["revenue_change_pct"]) and row["revenue_change_pct"] < lower_rev:
+            elif (not too_early_for_1day and lower_rev is not None
+                    and pd.notna(row["revenue_change_pct"]) and row["revenue_change_pct"] < lower_rev):
                 flags.append("📉 Revenue Drop")
             if (not row["no_sales"] and upper_fail is not None
                     and pd.notna(row["failure_rate_window_pct"]) and row["failure_rate_window_pct"] > upper_fail):
@@ -640,6 +695,13 @@ with tab_attention:
         )
 
         st.subheader("Attention List")
+        if too_early_for_1day:
+            st.caption(
+                f"Only ~{DAY_ELAPSED_FRACTION * 100:.0f}% of a typical day has elapsed so far — "
+                "too early to flag 'No Sales' or revenue drops for a 1-day window without false "
+                "alarms. Try Last 3 Days or more, or check back later today. High-failure flags "
+                "still apply."
+            )
         if flagged.empty:
             st.success(f"No machines flagged in the last {n_days} day(s).")
         else:
@@ -651,7 +713,8 @@ with tab_attention:
                     "revenue_change_pct", "failure_rate_window_pct", "lost_amount_window",
                 ]].rename(columns={
                     "machine_name": "Machine", "city": "City", "location": "Location",
-                    "revenue_window": f"Revenue (Last {n_days}d)", "revenue_change_pct": "vs Baseline %",
+                    "revenue_window": f"Revenue (Last {n_days}d)",
+                    "revenue_change_pct": "vs Baseline %" + (" (Pace-Adj.)" if IS_TODAY_PARTIAL else ""),
                     "failure_rate_window_pct": "Failure Rate %", "lost_amount_window": "Amount Lost",
                 }),
                 use_container_width=True, hide_index=True,
@@ -661,7 +724,9 @@ with tab_attention:
 
         st.subheader("Revenue Change vs Trailing 30-Day Baseline")
         chart_df = attn.dropna(subset=["revenue_change_pct"]).copy()
-        if chart_df.empty:
+        if too_early_for_1day:
+            st.info("Too early in the day for a reliable 1-day revenue-change comparison — see the caption above.")
+        elif chart_df.empty:
             st.info("Not enough baseline history yet to compare.")
         else:
             chart_df["status"] = chart_df.apply(
@@ -672,7 +737,8 @@ with tab_attention:
                 chart_df.sort_values("revenue_change_pct"), x="revenue_change_pct", y="machine_name",
                 orientation="h", color="status",
                 color_discrete_map={"No Sales": "#B85C5C", "Flagged": ACCENT, "Normal": PRIMARY},
-                title=f"Avg Daily Revenue, Last {n_days}d vs Trailing 30-Day Baseline",
+                title=f"Avg Daily Revenue, Last {n_days}d vs Trailing 30-Day Baseline"
+                      + (" (Pace-Adj.)" if IS_TODAY_PARTIAL else ""),
                 height=max(420, len(chart_df) * 22),
             )
             fig_attn.update_layout(xaxis_title="Change vs Baseline (%)", yaxis_title="")
@@ -712,6 +778,27 @@ with tab_today:
         ]
         period_labels = [p[0] for p in PERIODS]
 
+        def _effective_days(label, end, days):
+            """
+            A period that runs through today but isn't Today itself (Last 3 Days, Last
+            Week, This Month) has one partial day baked into its total. Divide by that
+            partial day's fraction instead of a full day, so the "avg/day" figure reflects
+            the period's true recent pace rather than being dragged down by an unfinished day.
+            Today itself is left as its own raw, un-projected total — never divided up.
+            """
+            if IS_TODAY_PARTIAL and label != "Today" and end == latest_date:
+                return days - 1 + DAY_ELAPSED_FRACTION
+            return days
+
+        if IS_TODAY_PARTIAL:
+            st.caption(
+                f"Today is still in progress (~{DAY_ELAPSED_FRACTION * 100:.0f}% of a typical day "
+                "elapsed) — Today's figures below are the raw total so far, and every comparison "
+                "period is pace-adjusted to that same point in the day before computing a % change, "
+                "for metrics that accumulate over the day (Revenue, Units, Amount Lost). Failure "
+                "Rate is a ratio and isn't time-adjusted."
+            )
+
         st.caption(
             f"This Month = {month_start.date()} → {latest_date.date()} ({days_elapsed} day(s) so far, "
             f"month-to-date). Last Month = {last_month_start.date()} → {last_month_end.date()} (full month)."
@@ -721,7 +808,8 @@ with tab_today:
         fleet_vals = {}
         for label, start, end, days in PERIODS:
             sub = txn_daily_today_base[(txn_daily_today_base["date"] >= start) & (txn_daily_today_base["date"] <= end)]
-            fleet_vals[label] = (sub["revenue"].sum() / days) if not sub.empty else 0.0
+            eff_days = _effective_days(label, end, days)
+            fleet_vals[label] = (sub["revenue"].sum() / eff_days) if not sub.empty else 0.0
 
         st.caption("**Avg Daily Revenue — Fleet (filtered)**")
         fleet_cols = st.columns(6)
@@ -730,13 +818,15 @@ with tab_today:
             if label == "Today":
                 col.metric(label, f"₹{val:,.0f}")
             else:
-                delta = (fleet_vals["Today"] - val) / val * 100 if val else None
-                col.metric(label, f"₹{val:,.0f}", delta=f"{delta:+.1f}% vs Today" if delta is not None else None)
+                comparison_val = val * DAY_ELAPSED_FRACTION if IS_TODAY_PARTIAL else val
+                delta = (fleet_vals["Today"] - comparison_val) / comparison_val * 100 if comparison_val else None
+                suffix = "vs Today (pace-adj.)" if IS_TODAY_PARTIAL else "vs Today"
+                col.metric(label, f"₹{val:,.0f}", delta=f"{delta:+.1f}% {suffix}" if delta is not None else None)
 
         st.divider()
 
         # ── Per-entity detail table ──────────────────────────────────────────
-        def _period_series(df, start, end, days, group_col, metric):
+        def _period_series(df, start, end, days, group_col, metric, label):
             sub = df[(df["date"] >= start) & (df["date"] <= end)]
             if sub.empty:
                 return pd.Series(dtype=float)
@@ -748,7 +838,7 @@ with tab_today:
                 )
                 rows_total = grp["rows_total"].sum()
                 return failure_rows / rows_total.replace(0, pd.NA) * 100
-            return sub.groupby(group_col)[metric].sum() / days
+            return sub.groupby(group_col)[metric].sum() / _effective_days(label, end, days)
 
         metric_options = {
             "revenue": ("Revenue (₹)", "₹{:,.0f}"),
@@ -769,9 +859,12 @@ with tab_today:
             )
         metric_label, metric_fmt = metric_options[td_metric]
         group_col = "machine_id" if td_level == "machine" else "location"
+        is_flow_metric = td_metric != "failure_rate_pct"
+        pace = DAY_ELAPSED_FRACTION if (IS_TODAY_PARTIAL and is_flow_metric) else 1.0
+        pace_note = " (pace-adj.)" if (IS_TODAY_PARTIAL and is_flow_metric) else ""
 
         wide = pd.DataFrame({
-            label: _period_series(txn_daily_today_base, start, end, days, group_col, td_metric)
+            label: _period_series(txn_daily_today_base, start, end, days, group_col, td_metric, label)
             for label, start, end, days in PERIODS
         })
 
@@ -791,17 +884,20 @@ with tab_today:
             if td_metric != "failure_rate_pct":
                 table[col] = table[col].fillna(0)
 
-        table["Δ Today vs Last Week %"] = (
-            (table["Today"] - table["Last Week"]) / table["Last Week"].replace(0, pd.NA) * 100
-        )
+        delta_col_names = []
+        for cmp_label in ("Yesterday", "Last Week"):
+            delta_col = f"Δ Today vs {cmp_label} %{pace_note}"
+            base_vals = table[cmp_label] * pace
+            table[delta_col] = (table["Today"] - base_vals) / base_vals.replace(0, pd.NA) * 100
+            delta_col_names.append(delta_col)
+
         table = table.sort_values("Today", ascending=False)
 
-        display = table[id_cols + period_labels + ["Δ Today vs Last Week %"]].rename(columns=rename_id)
+        display = table[id_cols + period_labels + delta_col_names].rename(columns=rename_id)
         for col in period_labels:
             display[col] = display[col].map(lambda v: metric_fmt.format(v) if pd.notna(v) else "—")
-        display["Δ Today vs Last Week %"] = display["Δ Today vs Last Week %"].map(
-            lambda v: f"{v:+.1f}%" if pd.notna(v) else "—"
-        )
+        for col in delta_col_names:
+            display[col] = display[col].map(lambda v: f"{v:+.1f}%" if pd.notna(v) else "—")
 
         st.subheader(f"{metric_label} — {td_level.title()} Level")
         st.dataframe(display, use_container_width=True, hide_index=True)
