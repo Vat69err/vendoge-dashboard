@@ -226,7 +226,18 @@ different shape.
 Combined KPIs (revenue, units, machine count) and a daily-revenue-by-brand
 chart across every connected line, plus a per-brand summary table. A line
 with no data source yet shows as "Not Connected" rather than being quietly
-left out of the totals.
+left out of the totals. Also includes a combined **Machine-wise Revenue
+Snapshot** — see below — across every machine on every connected line.
+
+### Machine-wise Revenue Snapshot
+
+Every section (Aggregate, Vendekin Snacks, Vendekin-Nestle Coffee) has a
+per-machine table: **Yesterday, D-2, D-3, Last 7 Days avg, Last 30 Days
+avg, Lifetime avg**. It's anchored strictly before today, so every figure
+is a complete day — nothing here needs the pace-adjustment the Today tab
+uses. The rolling/lifetime averages divide by how many days of data each
+machine actually has in that window, not a fixed day count, so a newer
+machine isn't understated.
 
 ### Vendekin Snacks
 
@@ -242,7 +253,8 @@ left out of the totals.
 - **KPI row:** total revenue, units sold, average daily revenue, machines
   in view, failure rate — all respect the filters above
 - **Overview tab:** D/D-1/D-2/average daily-revenue snapshot, daily revenue
-  trend, lifetime top-performer leaderboard (by machine/location/warehouse)
+  trend, lifetime top-performer leaderboard (by machine/location/warehouse),
+  and the Machine-wise Revenue Snapshot (see above)
 - **Needs Attention tab:** pick a 1-5 day lookback window and see which
   machines stopped selling, dropped in revenue, or had elevated failures
   vs. their own trailing 30-day baseline — always anchored to the latest
@@ -254,7 +266,9 @@ left out of the totals.
   totals
 - **Revenue & Sales tab:** daily revenue & units, revenue by hour of day,
   month-over-month trend (fleet-wide or drilled into one machine/
-  location/warehouse), top products by revenue
+  location/warehouse), top products by revenue, and a machine-wise
+  breakdown of each machine's top 3 products and its highest/lowest
+  revenue hour of day
 - **Refilling tab:** refill quantity by hour of day, refill totals by
   machine
 - **Failures tab:** dispense-timeout/paid-not-dispensed/payment-failed
@@ -283,10 +297,12 @@ there's no refill or product-category data for this line yet.
 - **Sidebar filters:** date range, city, machine
 - **KPI row:** total revenue, units sold, average daily revenue, machines
   in view, failure rate (`dispense_ok = FALSE`)
-- **Overview tab:** daily revenue trend, top machines by revenue
+- **Overview tab:** daily revenue trend, top machines by revenue, and the
+  Machine-wise Revenue Snapshot (see above)
 - **Revenue & Products tab:** daily revenue, revenue by hour of day (real
   hourly timestamps, unlike Snacks' month-level hourly pattern), top
-  products by revenue
+  products by revenue, and a machine-wise breakdown of each machine's
+  top 3 products and its highest/lowest revenue hour of day
 - **Failures tab:** failed-transaction count and amount lost, trend by
   day, top machines by amount lost, full failure log
 - **Machines tab:** directory derived from the transaction log itself
