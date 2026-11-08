@@ -308,6 +308,16 @@ there's no refill or product-category data for this line yet.
 - **Machines tab:** directory derived from the transaction log itself
   (no separate machine master data for this line) with revenue, units,
   and failure rate per machine
+- **Timing Anomalies tab:** pick a machine and a day (Today / D-1 / D-2),
+  and compare that day's hour-by-hour transaction count against the
+  machine's own trailing-30-day baseline for that hour (median,
+  ending 3 days before the chosen day). Flags hours that are normally
+  busy but came back unusually quiet — done both overall and per
+  product (top 3 by revenue), so one SKU/coil going quiet shows up
+  even when the rest of the machine looks healthy. This needs real
+  per-transaction timestamps, which only this line has today — Vendekin
+  Snacks' sheet is pre-aggregated (no per-day-hour or per-transaction
+  data), so this can't be built there until that changes.
 
 ### Wendor Snacks / Eazyvend Protein
 

@@ -2562,13 +2562,15 @@ def render_nestle_coffee():
         "Machines", cf_all_machines, default=cf_all_machines, key="coffee_machine_sel"
     )
 
-    cf = coffee_df[
-        (coffee_df["txn_date"].dt.date >= cf_start) & (coffee_df["txn_date"].dt.date <= cf_end)
-    ]
+    cf_full = coffee_df
     if cf_city_sel:
-        cf = cf[cf["city"].isin(cf_city_sel)]
+        cf_full = cf_full[cf_full["city"].isin(cf_city_sel)]
     if cf_machine_sel:
-        cf = cf[cf["machine_name"].isin(cf_machine_sel)]
+        cf_full = cf_full[cf_full["machine_name"].isin(cf_machine_sel)]
+
+    cf = cf_full[
+        (cf_full["txn_date"].dt.date >= cf_start) & (cf_full["txn_date"].dt.date <= cf_end)
+    ]
 
     if cf.empty:
         st.warning("No data for the current filters.")
@@ -2593,8 +2595,8 @@ def render_nestle_coffee():
 
     st.divider()
 
-    tab_cf_overview, tab_cf_revenue, tab_cf_failures, tab_cf_machines = st.tabs(
-        ["📊 Overview", "💰 Revenue & Products", "🚫 Failures", "🖥️ Machines"]
+    tab_cf_overview, tab_cf_revenue, tab_cf_failures, tab_cf_machines, tab_cf_timing = st.tabs(
+        ["📊 Overview", "💰 Revenue & Products", "🚫 Failures", "🖥️ Machines", "⏱️ Timing Anomalies"]
     )
 
     with tab_cf_overview:
@@ -2791,6 +2793,154 @@ def render_nestle_coffee():
             }),
             use_container_width=True, hide_index=True,
         )
+
+    # ---------- TIMING ANOMALIES ----------
+    with tab_cf_timing:
+        st.subheader("⏱️ Timing Anomalies")
+        st.caption(
+            "Compares a chosen day's hour-by-hour transaction pattern against this machine's own "
+            "typical pattern for that hour (trailing 30-day baseline, ending 3 days before the "
+            "chosen day). A big drop in an hour that's normally busy can point to a stuck "
+            "coil/dispenser or an outage — even if other hours, or other products on the same "
+            "machine, look fine. Same idea applied per product catches one SKU failing while "
+            "the rest of the machine keeps selling."
+        )
+
+        cf_full_success = cf_full[cf_full["dispense_ok"] == True]  # noqa: E712
+        ta_latest = cf_full["txn_date"].max()
+
+        if pd.isna(ta_latest):
+            st.info("No data available for the current City/Machine filters.")
+        else:
+            ta_machines = sorted(cf_full["machine_name"].dropna().unique().tolist())
+            ta_c1, ta_c2 = st.columns(2)
+            with ta_c1:
+                ta_machine = st.selectbox("Machine", ta_machines, key="cf_timing_machine")
+            with ta_c2:
+                ta_day_choice = st.radio("Day", ["Today", "D-1", "D-2"], horizontal=True, key="cf_timing_day")
+            ta_offset = {"Today": 0, "D-1": 1, "D-2": 2}[ta_day_choice]
+            ta_day = ta_latest - pd.Timedelta(days=ta_offset)
+
+            ta_baseline_end = ta_latest - pd.Timedelta(days=3)
+            ta_baseline_start = ta_baseline_end - pd.Timedelta(days=29)
+
+            st.caption(
+                f"Inspecting **{ta_day.date()}** ({ta_day_choice}) for **{ta_machine}**, vs. baseline "
+                f"**{ta_baseline_start.date()} → {ta_baseline_end.date()}** (trailing 30 days)."
+            )
+
+            m_success = cf_full_success[cf_full_success["machine_name"] == ta_machine]
+            m_baseline = m_success[
+                (m_success["txn_date"] >= ta_baseline_start) & (m_success["txn_date"] <= ta_baseline_end)
+            ]
+
+            if m_baseline.empty:
+                st.info("Not enough baseline history yet for this machine (need some days before D-3).")
+            else:
+                _baseline_dates = pd.date_range(ta_baseline_start, ta_baseline_end, freq="D")
+
+                def _hourly_actual_vs_baseline(product: str = None):
+                    base = m_baseline if product is None else m_baseline[m_baseline["product_name"] == product]
+                    day_df = m_success[m_success["txn_date"] == ta_day]
+                    if product is not None:
+                        day_df = day_df[day_df["product_name"] == product]
+
+                    grid = pd.MultiIndex.from_product(
+                        [_baseline_dates, range(24)], names=["date", "hour"]
+                    ).to_frame(index=False)
+                    actual = base.groupby([base["txn_date"], base["txn_ts"].dt.hour]).size().reset_index()
+                    actual.columns = ["date", "hour", "count"]
+                    grid = grid.merge(actual, on=["date", "hour"], how="left")
+                    grid["count"] = grid["count"].fillna(0)
+                    baseline_median = grid.groupby("hour")["count"].median().reindex(range(24), fill_value=0)
+
+                    day_counts = day_df.groupby(day_df["txn_ts"].dt.hour).size().reindex(range(24), fill_value=0)
+
+                    out = pd.DataFrame({
+                        "hour": range(24), "actual": day_counts.values, "baseline": baseline_median.values,
+                    })
+                    out["pct_of_normal"] = out.apply(
+                        lambda r: (r["actual"] / r["baseline"] * 100) if r["baseline"] > 0 else pd.NA, axis=1
+                    )
+                    out["flag"] = (out["baseline"] >= 2) & (out["actual"] <= out["baseline"] * 0.3)
+                    return out
+
+                st.markdown("**Overall (all products)**")
+                overall = _hourly_actual_vs_baseline()
+                chart_df = overall.melt(id_vars="hour", value_vars=["actual", "baseline"],
+                                         var_name="series", value_name="transactions")
+                chart_df["series"] = chart_df["series"].map({"actual": ta_day_choice, "baseline": "Baseline (median)"})
+                fig_ta = px.bar(
+                    chart_df, x="hour", y="transactions", color="series", barmode="group",
+                    title=f"Transactions by Hour — {ta_machine}",
+                    color_discrete_map={ta_day_choice: PRIMARY, "Baseline (median)": "#B0B8C1"},
+                )
+                fig_ta.update_layout(xaxis_title="Hour", yaxis_title="Transactions", xaxis=dict(dtick=1), legend_title="")
+                st.plotly_chart(fig_ta, use_container_width=True)
+
+                flagged_hours = overall[overall["flag"]]
+                if flagged_hours.empty:
+                    st.success(f"No unusually quiet hours detected for {ta_machine} on {ta_day_choice}. 🎉")
+                else:
+                    disp = flagged_hours[["hour", "actual", "baseline", "pct_of_normal"]].copy()
+                    disp["hour"] = disp["hour"].map(_fmt_hour)
+                    disp["pct_of_normal"] = disp["pct_of_normal"].map(
+                        lambda v: f"{v:.0f}%" if pd.notna(v) else "—"
+                    )
+                    st.warning(f"⚠️ {len(flagged_hours)} unusually quiet hour(s) found for {ta_machine} on {ta_day_choice}:")
+                    st.dataframe(
+                        disp.rename(columns={
+                            "hour": "Hour", "actual": "Transactions", "baseline": "Normal (median)",
+                            "pct_of_normal": "% of Normal",
+                        }),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                st.divider()
+                st.markdown("**Per Product (top 3 by revenue)**")
+                st.caption("Catches a single SKU/coil going quiet even while the machine overall looks fine.")
+                _top3_products = (
+                    m_success.groupby("product_name")["amount"].sum().sort_values(ascending=False).head(3).index.tolist()
+                )
+                if not _top3_products:
+                    st.info("No successful sales history for this machine to rank products by.")
+                else:
+                    ta_product = st.selectbox("Product", _top3_products, key="cf_timing_product")
+                    per_sku = _hourly_actual_vs_baseline(ta_product)
+                    flagged_sku_hours = per_sku[per_sku["flag"]]
+
+                    sku_chart_df = per_sku.melt(id_vars="hour", value_vars=["actual", "baseline"],
+                                                 var_name="series", value_name="transactions")
+                    sku_chart_df["series"] = sku_chart_df["series"].map(
+                        {"actual": ta_day_choice, "baseline": "Baseline (median)"}
+                    )
+                    fig_sku = px.bar(
+                        sku_chart_df, x="hour", y="transactions", color="series", barmode="group",
+                        title=f"{ta_product} — Transactions by Hour — {ta_machine}",
+                        color_discrete_map={ta_day_choice: ACCENT, "Baseline (median)": "#B0B8C1"},
+                    )
+                    fig_sku.update_layout(xaxis_title="Hour", yaxis_title="Transactions", xaxis=dict(dtick=1), legend_title="")
+                    st.plotly_chart(fig_sku, use_container_width=True)
+
+                    if flagged_sku_hours.empty:
+                        st.success(f"No unusually quiet hours for {ta_product} on {ta_machine} ({ta_day_choice}). 🎉")
+                    else:
+                        sku_disp = flagged_sku_hours[["hour", "actual", "baseline", "pct_of_normal"]].copy()
+                        sku_disp["hour"] = sku_disp["hour"].map(_fmt_hour)
+                        sku_disp["pct_of_normal"] = sku_disp["pct_of_normal"].map(
+                            lambda v: f"{v:.0f}%" if pd.notna(v) else "—"
+                        )
+                        st.warning(
+                            f"⚠️ {len(flagged_sku_hours)} unusually quiet hour(s) for **{ta_product}** "
+                            f"on {ta_machine} ({ta_day_choice}):"
+                        )
+                        st.dataframe(
+                            sku_disp.rename(columns={
+                                "hour": "Hour", "actual": "Transactions", "baseline": "Normal (median)",
+                                "pct_of_normal": "% of Normal",
+                            }),
+                            use_container_width=True, hide_index=True,
+                        )
 
 
 # ============================================================
