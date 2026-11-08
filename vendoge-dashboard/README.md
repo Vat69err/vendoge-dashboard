@@ -128,6 +128,53 @@ will just show an info message instead of erroring.
 
 ---
 
+### Optional: Margin & COGS
+
+Adds a **Margin & COGS** tab to Vendekin Snacks, Wendor Snacks, and
+Vendekin-Nestle Coffee (plus a blended margin column on Aggregate's Brand
+Summary), from two cost-reference sheet tabs:
+
+```toml
+[sheets]
+dashboard = "..."
+margin_cogs = "PASTE_THE_MARGIN_SHEET_ID_HERE"
+
+[gids.margin_cogs]
+snacks_wendor = "PASTE_THE_DISTRIBUTORS_X_SKU_X_MARGIN_TAB_GID_HERE"
+coffee = "PASTE_THE_DUO_GUSTO_COSTS_TAB_GID_HERE"
+```
+
+- **`snacks_wendor`** feeds both Vendekin Snacks and Wendor Snacks. It's a
+  running distributor-invoice ledger (one row per delivery, so the same
+  SKU can appear many times over as costs or distributors change) — the
+  app keeps only each SKU's most-recently-dated row as its current unit
+  cost (`Rate Per Packet Inclusive GST`, i.e. the GST-inclusive cost of one
+  vended packet).
+- **`coffee`** feeds Vendekin-Nestle Coffee. It reads the per-beverage
+  "Fully-Loaded Cost/Cup" summary table from the cost sheet, located by
+  its header row rather than a fixed row count, so edits to the sheet
+  don't need a code change.
+- A raw transaction's `product_name` rarely matches the cost sheet's own
+  naming exactly, so matching degrades through a few safe tiers (exact
+  name, then price-suffix-stripped, then punctuation/spacing-normalized)
+  — but **never past a disagreeing price**: e.g. "Diet Coke Can Rs 30" and
+  "...Rs 50" are different SKUs, not noise, so if a product name states a
+  price it must agree with the matched SKU's own price. Anything that
+  can't be matched with confidence shows up as "unpriced" in the tab
+  rather than being guessed at or treated as zero-cost — this is
+  deliberate: real coverage on the sample data is well under 100%
+  (particularly for Wendor, whose product names rarely include a brand
+  prefix or price at all), and margin % shown is always over
+  cost-matched revenue only, with the coverage % shown alongside it.
+- Coffee beverages with no recipe/cost basis in the sheet (e.g. Masala
+  Chai, Shikanji, as flagged in that sheet's own notes) simply don't
+  appear in the cost lookup, so they correctly show as unpriced rather
+  than free.
+- Leave this out and the Margin & COGS tabs show a message instead of
+  erroring; revenue elsewhere in the dashboard is unaffected either way.
+
+---
+
 ## 2. Run it locally first (recommended before deploying)
 
 Open a terminal in this folder and run:
@@ -245,10 +292,13 @@ different shape.
 ### Aggregate
 
 Combined KPIs (revenue, units, machine count) and a daily-revenue-by-brand
-chart across every connected line, plus a per-brand summary table. A line
-with no data source yet shows as "Not Connected" rather than being quietly
-left out of the totals. Also includes a combined **Machine-wise Revenue
-Snapshot** — see below — across every machine on every connected line.
+chart across every connected line, plus a per-brand summary table — now
+including a **Blended Margin %** column (over cost-matched revenue only;
+see "Optional: Margin & COGS" above) wherever a brand's cost sheet is
+connected. A line with no data source yet shows as "Not Connected" rather
+than being quietly left out of the totals. Also includes a combined
+**Machine-wise Revenue Snapshot** — see below — across every machine on
+every connected line.
 
 ### Machine-wise Revenue Snapshot
 
@@ -304,6 +354,10 @@ machine isn't understated.
   (revenue, failure rate, amount lost, recent revenue momentum), plus
   the most volatile machines by day-to-day revenue and machines with an
   unusually high/low share of a product category
+- **Margin & COGS tab:** fleet-wide (same scope as SKU Mix — not affected
+  by the sidebar filters) per-product revenue, matched unit cost, COGS
+  and gross margin, plus cost-data coverage % and a list of unpriced
+  products — see "Optional: Margin & COGS" above
 - **Accounts tab:** bank ledger KPIs, P&L snapshot and waterfall, cash
   flow analytics, full transaction log — reads the separate accounts
   sheet (see "Optional: Accounts / HR tabs" above)
@@ -339,6 +393,11 @@ there's no refill or product-category data for this line yet.
   per-transaction timestamps, which only this line has today — Vendekin
   Snacks' sheet is pre-aggregated (no per-day-hour or per-transaction
   data), so this can't be built there until that changes.
+- **Margin & COGS tab:** respects the sidebar filters. Per-beverage
+  revenue, matched cost (from the Duo Gusto Costs sheet), COGS and gross
+  margin, plus coverage % — see "Optional: Margin & COGS" above.
+  Beverages with no recipe/cost basis (e.g. Masala Chai, Shikanji) show
+  as unpriced, not free.
 
 ### Wendor Snacks
 
@@ -371,6 +430,11 @@ not dispensed, not refunded) using `payment_status`.
   and a day (Today / D-1 / D-2), compare that day's hour-by-hour
   transaction count against the machine's own 30-day baseline for that
   hour, overall and per top-3 product
+- **Margin & COGS tab:** respects the sidebar filters. Same cost sheet
+  and matching rules as Vendekin Snacks' Margin & COGS tab (they share
+  the `snacks_wendor` cost data) — see "Optional: Margin & COGS" above.
+  Coverage tends to be lower here than for Vendekin Snacks, since this
+  sheet's product names rarely include a brand prefix or price.
 
 ### Eazyvend Protein
 
