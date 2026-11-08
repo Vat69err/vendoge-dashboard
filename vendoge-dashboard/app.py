@@ -331,6 +331,51 @@ else:
 
 COFFEE_DATA_OK = COFFEE_LOAD_ERROR is None and not coffee_df.empty
 
+# ============================================================
+# 2c. WENDOR SNACKS — raw per-transaction data (a separate sheet)
+# ============================================================
+WENDOR_SHEET_ID = st.secrets.get("sheets", {}).get("wendor_snacks")
+WENDOR_GID = (
+    str(st.secrets.get("gids", {}).get("wendor_snacks", {}).get("transactions", ""))
+    if WENDOR_SHEET_ID else ""
+)
+
+
+def _wendor_csv_url(gid: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{WENDOR_SHEET_ID}/export?format=csv&gid={gid}"
+
+
+@st.cache_data(ttl=300, show_spinner="Pulling latest Wendor Snacks data...")
+def load_wendor_snacks() -> pd.DataFrame:
+    df = pd.read_csv(_wendor_csv_url(WENDOR_GID))
+    df["txn_datetime"] = pd.to_datetime(df.get("txn_datetime"), errors="coerce")
+    df["txn_date"] = pd.to_datetime(df.get("txn_date"), errors="coerce")
+    _to_num(df, ["quantity", "mrp", "paid_price", "amount", "is_sale", "rating", "position"])
+    _to_str_id(df, "machine_id")
+    for col in ("payment_status", "vend_status", "vend_comment"):
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+    # is_sale is the cleanest success flag: 1 iff vend_status == "completed".
+    df["is_sale"] = df["is_sale"].fillna(0).astype(bool)
+    return df
+
+
+if WENDOR_SHEET_ID and WENDOR_GID:
+    try:
+        wendor_df = load_wendor_snacks()
+        WENDOR_LOAD_ERROR = None
+    except Exception as e:
+        wendor_df = pd.DataFrame()
+        WENDOR_LOAD_ERROR = f"Couldn't load the Wendor Snacks sheet.\n\nTechnical detail: {e}"
+else:
+    wendor_df = pd.DataFrame()
+    WENDOR_LOAD_ERROR = (
+        "Missing secrets! This section needs `[sheets] wendor_snacks` (the sheet ID) and "
+        "`[gids.wendor_snacks] transactions` (the tab's gid) set up in Streamlit secrets."
+    )
+
+WENDOR_DATA_OK = WENDOR_LOAD_ERROR is None and not wendor_df.empty
+
 
 # ============================================================
 # SHARED: machine-wise revenue snapshot (Yesterday / D-2 / D-3 / 7d / 30d / lifetime)
@@ -2993,11 +3038,30 @@ def render_aggregate():
             "Total Revenue": 0.0, "Total Units": 0, "Machines": 0, "Date Range": "—",
         })
 
-    for not_yet in ("Wendor Snacks", "Eazyvend Protein"):
+    if WENDOR_DATA_OK:
+        w_success = wendor_df[wendor_df["is_sale"]]
+        w_daily = w_success.groupby(w_success["txn_date"].dt.date)["amount"].sum().reset_index()
+        w_daily.columns = ["date", "revenue"]
+        w_daily["date"] = pd.to_datetime(w_daily["date"])
+        w_daily["brand"] = "Wendor Snacks"
+        daily_frames.append(w_daily[["date", "revenue", "brand"]])
         brand_rows.append({
-            "Brand": not_yet, "Status": "Not Connected",
+            "Brand": "Wendor Snacks", "Status": "Connected",
+            "Total Revenue": w_success["amount"].sum(),
+            "Total Units": len(w_success),
+            "Machines": wendor_df["machine_id"].nunique(),
+            "Date Range": f"{wendor_df['txn_date'].min().date()} → {wendor_df['txn_date'].max().date()}",
+        })
+    else:
+        brand_rows.append({
+            "Brand": "Wendor Snacks", "Status": "Not Connected",
             "Total Revenue": 0.0, "Total Units": 0, "Machines": 0, "Date Range": "—",
         })
+
+    brand_rows.append({
+        "Brand": "Eazyvend Protein", "Status": "Not Connected",
+        "Total Revenue": 0.0, "Total Units": 0, "Machines": 0, "Date Range": "—",
+    })
 
     total_revenue = sum(b["Total Revenue"] for b in brand_rows)
     total_units = sum(b["Total Units"] for b in brand_rows)
@@ -3058,6 +3122,18 @@ def render_aggregate():
         if not _c_snap.empty:
             _c_snap.insert(0, "Brand", "Vendekin-Nestle Coffee")
             snap_frames.append(_c_snap)
+    if WENDOR_DATA_OK:
+        _w_success = wendor_df[wendor_df["is_sale"]]
+        _w_latest = wendor_df["txn_date"].max()
+        _w_daily_by_machine = (
+            _w_success.groupby(["machine_id", "machine_name", _w_success["txn_date"]])["amount"]
+            .sum().reset_index().rename(columns={"txn_date": "date", "amount": "revenue"})
+        )
+        _w_snap = machine_revenue_snapshot(_w_daily_by_machine, ["machine_id", "machine_name"], _w_latest)
+        if not _w_snap.empty:
+            _w_snap.insert(0, "Brand", "Wendor Snacks")
+            _w_snap["city"] = "—"
+            snap_frames.append(_w_snap)
 
     if not snap_frames:
         st.info("No connected line has enough history yet (need at least a day before today).")
@@ -3072,6 +3148,424 @@ def render_aggregate():
             combined_disp.rename(columns={"machine_name": "Machine", "city": "City"}),
             use_container_width=True, hide_index=True,
         )
+
+
+# ============================================================
+# WENDOR SNACKS SECTION
+# ============================================================
+def render_wendor_snacks():
+    if not WENDOR_DATA_OK:
+        st.error(WENDOR_LOAD_ERROR)
+        return
+
+    st.subheader("🧃 Wendor Snacks")
+    st.caption(
+        "Live view of Wendor machine revenue and dispense failures, built from raw "
+        "per-transaction data. No city is recorded in this sheet, so filtering/grouping "
+        "here is by machine only."
+    )
+
+    st.sidebar.caption("Filters — Wendor Snacks")
+    wd_min_date = wendor_df["txn_date"].min()
+    wd_max_date = wendor_df["txn_date"].max()
+    wd_date_range = st.sidebar.date_input(
+        "Date range", value=(wd_min_date.date(), wd_max_date.date()),
+        min_value=wd_min_date.date(), max_value=wd_max_date.date(), key="wendor_date_range",
+    )
+    if isinstance(wd_date_range, tuple) and len(wd_date_range) == 2:
+        wd_start, wd_end = wd_date_range
+    else:
+        wd_start, wd_end = wd_min_date.date(), wd_max_date.date()
+
+    wd_all_machines = sorted(wendor_df["machine_name"].dropna().unique().tolist())
+    wd_machine_sel = st.sidebar.multiselect(
+        "Machines", wd_all_machines, default=wd_all_machines, key="wendor_machine_sel"
+    )
+
+    wd_full = wendor_df
+    if wd_machine_sel:
+        wd_full = wd_full[wd_full["machine_name"].isin(wd_machine_sel)]
+
+    wd = wd_full[(wd_full["txn_date"].dt.date >= wd_start) & (wd_full["txn_date"].dt.date <= wd_end)]
+
+    if wd.empty:
+        st.warning("No data for the current filters.")
+        return
+
+    success = wd[wd["is_sale"]]
+    failed = wd[~wd["is_sale"]]
+    refunded = failed[failed["payment_status"] == "refunded"]
+    lost = failed[failed["payment_status"] != "refunded"]
+
+    total_revenue = success["amount"].sum()
+    total_units = len(success)  # quantity is always 1/row in this sheet; one row = one unit
+    active_days = wd["txn_date"].dt.date.nunique() or 1
+    avg_daily_revenue = total_revenue / active_days
+    active_machines = wd["machine_id"].nunique()
+    failure_rate = (len(failed) / len(wd) * 100) if len(wd) else 0.0
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Total Revenue", f"₹{total_revenue:,.0f}")
+    k2.metric("Units Sold", f"{total_units:,.0f}")
+    k3.metric("Avg Daily Revenue", f"₹{avg_daily_revenue:,.0f}")
+    k4.metric("Machines in View", f"{active_machines:,}")
+    k5.metric("Failure Rate", f"{failure_rate:.2f}%")
+
+    st.divider()
+
+    tab_wd_overview, tab_wd_revenue, tab_wd_failures, tab_wd_machines, tab_wd_timing = st.tabs(
+        ["📊 Overview", "💰 Revenue & Products", "🚫 Failures", "🖥️ Machines", "⏱️ Timing Anomalies"]
+    )
+
+    with tab_wd_overview:
+        daily = success.groupby(success["txn_date"].dt.date)["amount"].sum().reset_index()
+        daily.columns = ["date", "revenue"]
+        fig_daily = px.bar(daily, x="date", y="revenue", title="Daily Revenue Trend",
+                            color_discrete_sequence=[PRIMARY])
+        fig_daily.update_layout(xaxis_title="", yaxis_title="Revenue (₹)")
+        st.plotly_chart(fig_daily, use_container_width=True)
+
+        st.divider()
+        st.subheader("🏆 Top Machines by Revenue")
+        by_machine = (
+            success.groupby("machine_name", as_index=False)["amount"].sum()
+            .sort_values("amount", ascending=False).head(10)
+        )
+        if by_machine.empty:
+            st.info("No successful sales for the current filters.")
+        else:
+            fig_top = px.bar(
+                by_machine.sort_values("amount"), x="amount", y="machine_name", orientation="h",
+                title="Top Machines by Revenue", color_discrete_sequence=[ACCENT],
+            )
+            fig_top.update_layout(xaxis_title="Revenue (₹)", yaxis_title="")
+            st.plotly_chart(fig_top, use_container_width=True)
+
+        st.divider()
+
+        st.subheader("Machine-wise Revenue Snapshot")
+        st.caption(
+            "Yesterday, D-2, D-3, and rolling/lifetime averages, per machine — every period here "
+            "is a complete day (today is excluded)."
+        )
+        wd_latest = wd_full["txn_date"].max()
+        wd_daily_by_machine = (
+            wd_full[wd_full["is_sale"]]
+            .groupby(["machine_id", "machine_name", wd_full["txn_date"]])["amount"]
+            .sum().reset_index().rename(columns={"txn_date": "date", "amount": "revenue"})
+        )
+        wd_snap = machine_revenue_snapshot(wd_daily_by_machine, ["machine_id", "machine_name"], wd_latest)
+        if wd_snap.empty:
+            st.info("Not enough history yet (need at least a day before today).")
+        else:
+            wd_snap_disp = wd_snap.sort_values("Yesterday", ascending=False).drop(columns=["machine_id"])
+            for _col in ("Yesterday", "D-2", "D-3", "Last 7d Avg", "Last 30d Avg", "Lifetime Avg"):
+                wd_snap_disp[_col] = wd_snap_disp[_col].map(lambda v: f"₹{v:,.0f}")
+            st.dataframe(
+                wd_snap_disp.rename(columns={"machine_name": "Machine"}),
+                use_container_width=True, hide_index=True,
+            )
+
+    with tab_wd_revenue:
+        rv_c1, rv_c2 = st.columns(2)
+        with rv_c1:
+            daily2 = success.groupby(success["txn_date"].dt.date)["amount"].sum().reset_index()
+            daily2.columns = ["date", "revenue"]
+            fig_d = px.line(daily2, x="date", y="revenue", markers=True, title="Daily Revenue",
+                             color_discrete_sequence=[PRIMARY])
+            fig_d.update_layout(xaxis_title="", yaxis_title="Revenue (₹)")
+            st.plotly_chart(fig_d, use_container_width=True)
+        with rv_c2:
+            hourly = (
+                success.groupby(success["txn_datetime"].dt.hour)["amount"].sum()
+                .reindex(range(24), fill_value=0).reset_index()
+            )
+            hourly.columns = ["hour", "revenue"]
+            fig_h = px.bar(hourly, x="hour", y="revenue", title="Revenue by Hour of Day",
+                            color_discrete_sequence=[ACCENT])
+            fig_h.update_layout(xaxis_title="Hour", yaxis_title="Revenue (₹)", xaxis=dict(dtick=1))
+            st.plotly_chart(fig_h, use_container_width=True)
+
+        st.divider()
+        st.subheader("🏷️ Top Products")
+        prod_agg = (
+            success.groupby("product_name", as_index=False)
+            .agg(units_sold=("amount", "size"), revenue=("amount", "sum"))
+            .sort_values("revenue", ascending=False)
+        )
+        if prod_agg.empty:
+            st.info("No successful sales for the current filters.")
+        else:
+            fig_p = px.bar(
+                prod_agg.head(15).sort_values("revenue"), x="revenue", y="product_name", orientation="h",
+                title="Top 15 Products by Revenue", color_discrete_sequence=[PRIMARY],
+            )
+            fig_p.update_layout(xaxis_title="Revenue (₹)", yaxis_title="")
+            st.plotly_chart(fig_p, use_container_width=True)
+            st.dataframe(
+                prod_agg.rename(columns={
+                    "product_name": "Product", "units_sold": "Units Sold", "revenue": "Revenue",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+        st.divider()
+
+        st.subheader("Machine-wise: Top 3 Products & Peak Timing")
+        st.caption(
+            "Each machine's top 3 products by revenue and its highest/lowest revenue hour of "
+            "day, from real transaction timestamps, within the current filters."
+        )
+        if success.empty:
+            st.info("No successful sales for the current filters.")
+        else:
+            _wd_mp_rows = []
+            for _mid in sorted(success["machine_id"].unique()):
+                _g = success[success["machine_id"] == _mid]
+                _top3 = _g.groupby("product_name")["amount"].sum().sort_values(ascending=False).head(3)
+                _row = {"machine_id": _mid, "machine_name": _g["machine_name"].iloc[0]}
+                for _i in range(3):
+                    _row[f"Top {_i + 1}"] = (
+                        f"{_top3.index[_i]} (₹{_top3.iloc[_i]:,.0f})" if _i < len(_top3) else "—"
+                    )
+                _by_hour = _g.groupby(_g["txn_datetime"].dt.hour)["amount"].sum().reindex(range(24), fill_value=0)
+                _row["Peak Hour"] = f"{_fmt_hour(int(_by_hour.idxmax()))} (₹{_by_hour.max():,.0f})"
+                _row["Low Hour"] = f"{_fmt_hour(int(_by_hour.idxmin()))} (₹{_by_hour.min():,.0f})"
+                _wd_mp_rows.append(_row)
+            _wd_mp_df = pd.DataFrame(_wd_mp_rows)
+            st.dataframe(
+                _wd_mp_df[["machine_name", "Top 1", "Top 2", "Top 3", "Peak Hour", "Low Hour"]]
+                .rename(columns={"machine_name": "Machine"}),
+                use_container_width=True, hide_index=True,
+            )
+
+    with tab_wd_failures:
+        fl_c1, fl_c2, fl_c3, fl_c4 = st.columns(4)
+        fl_c1.metric("Failed Transactions", f"{len(failed):,}")
+        fl_c2.metric("Amount Lost (Not Refunded)", f"₹{lost['amount'].sum():,.0f}")
+        fl_c3.metric("Refunded", f"{len(refunded):,} (₹{refunded['amount'].sum():,.0f})")
+        fl_c4.metric("Failure Rate", f"{failure_rate:.2f}%")
+
+        st.divider()
+
+        if failed.empty:
+            st.success("No dispense failures for the current filters. 🎉")
+        else:
+            trend = failed.groupby(failed["txn_date"].dt.date).size().reset_index()
+            trend.columns = ["date", "failed_count"]
+            fig_fail = px.bar(trend, x="date", y="failed_count", title="Failed Transactions by Day",
+                               color_discrete_sequence=[ACCENT])
+            fig_fail.update_layout(xaxis_title="", yaxis_title="Failed Transactions")
+            st.plotly_chart(fig_fail, use_container_width=True)
+
+            by_machine_fail = (
+                failed.groupby("machine_name", as_index=False)
+                .agg(failed_count=("amount", "size"), amount_at_risk=("amount", "sum"))
+                .sort_values("amount_at_risk", ascending=False).head(10)
+            )
+            fig_fm = px.bar(
+                by_machine_fail.sort_values("amount_at_risk"), x="amount_at_risk", y="machine_name", orientation="h",
+                title="Top Machines by Amount at Risk (Failed, Refunded or Not)", color_discrete_sequence=[PRIMARY],
+            )
+            fig_fm.update_layout(xaxis_title="Amount (₹)", yaxis_title="")
+            st.plotly_chart(fig_fm, use_container_width=True)
+
+            st.divider()
+            st.subheader("Failure Reasons")
+            reason_agg = failed.groupby("vend_comment", as_index=False).size().rename(columns={"size": "count"})
+            reason_agg = reason_agg.sort_values("count", ascending=False)
+            fig_reason = px.bar(
+                reason_agg.sort_values("count"), x="count", y="vend_comment", orientation="h",
+                title="Failures by Reason", color_discrete_sequence=[ACCENT],
+            )
+            fig_reason.update_layout(xaxis_title="Count", yaxis_title="")
+            st.plotly_chart(fig_reason, use_container_width=True)
+
+            st.dataframe(
+                failed[["txn_date", "machine_name", "product_name", "amount", "payment_status", "vend_comment"]]
+                .sort_values("txn_date", ascending=False)
+                .rename(columns={
+                    "txn_date": "Date", "machine_name": "Machine", "product_name": "Product",
+                    "amount": "Amount", "payment_status": "Payment Status", "vend_comment": "Reason",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+    with tab_wd_machines:
+        st.subheader("🖥️ Machine Directory")
+        directory = wd.groupby(["machine_id", "machine_name"], as_index=False).size().rename(columns={"size": "transactions"})
+        rev_by_machine = success.groupby("machine_id")["amount"].sum().rename("revenue")
+        units_by_machine = success.groupby("machine_id").size().rename("units")
+        fail_by_machine = failed.groupby("machine_id").size().rename("failed_count")
+        directory = directory.merge(rev_by_machine, on="machine_id", how="left")
+        directory = directory.merge(units_by_machine, on="machine_id", how="left")
+        directory = directory.merge(fail_by_machine, on="machine_id", how="left")
+        for col in ("revenue", "units", "failed_count"):
+            directory[col] = directory[col].fillna(0)
+        directory["failure_rate_pct"] = directory["failed_count"] / directory["transactions"].replace(0, pd.NA) * 100
+        directory = directory.sort_values("revenue", ascending=False)
+
+        mc1, mc2 = st.columns(2)
+        mc1.metric("Machines", f"{directory['machine_id'].nunique():,}")
+        mc2.metric("Total Transactions", f"{len(wd):,}")
+
+        st.divider()
+        st.dataframe(
+            directory.rename(columns={
+                "machine_id": "ID", "machine_name": "Machine",
+                "transactions": "Transactions", "revenue": "Revenue", "units": "Units Sold",
+                "failed_count": "Failed", "failure_rate_pct": "Failure Rate %",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+
+    # ---------- TIMING ANOMALIES ----------
+    with tab_wd_timing:
+        st.subheader("⏱️ Timing Anomalies")
+        st.caption(
+            "Compares a chosen day's hour-by-hour transaction pattern against this machine's own "
+            "typical pattern for that hour (trailing 30-day baseline, ending 3 days before the "
+            "chosen day). A big drop in an hour that's normally busy can point to a stuck "
+            "coil/dispenser (e.g. a `VEND_FAILED_NUDGE_MAXED` run) or an outage — done both "
+            "overall and per product, so one SKU/coil failing shows up even if the rest of the "
+            "machine looks fine."
+        )
+
+        wd_full_success = wd_full[wd_full["is_sale"]]
+        ta_latest = wd_full["txn_date"].max()
+
+        if pd.isna(ta_latest):
+            st.info("No data available for the current Machine filter.")
+        else:
+            ta_machines = sorted(wd_full["machine_name"].dropna().unique().tolist())
+            ta_c1, ta_c2 = st.columns(2)
+            with ta_c1:
+                ta_machine = st.selectbox("Machine", ta_machines, key="wendor_timing_machine")
+            with ta_c2:
+                ta_day_choice = st.radio("Day", ["Today", "D-1", "D-2"], horizontal=True, key="wendor_timing_day")
+            ta_offset = {"Today": 0, "D-1": 1, "D-2": 2}[ta_day_choice]
+            ta_day = ta_latest - pd.Timedelta(days=ta_offset)
+
+            ta_baseline_end = ta_latest - pd.Timedelta(days=3)
+            ta_baseline_start = ta_baseline_end - pd.Timedelta(days=29)
+
+            st.caption(
+                f"Inspecting **{ta_day.date()}** ({ta_day_choice}) for **{ta_machine}**, vs. baseline "
+                f"**{ta_baseline_start.date()} → {ta_baseline_end.date()}** (trailing 30 days)."
+            )
+
+            m_success = wd_full_success[wd_full_success["machine_name"] == ta_machine]
+            m_baseline = m_success[
+                (m_success["txn_date"] >= ta_baseline_start) & (m_success["txn_date"] <= ta_baseline_end)
+            ]
+
+            if m_baseline.empty:
+                st.info("Not enough baseline history yet for this machine (need some days before D-3).")
+            else:
+                _baseline_dates = pd.date_range(ta_baseline_start, ta_baseline_end, freq="D")
+
+                def _hourly_actual_vs_baseline(product: str = None):
+                    base = m_baseline if product is None else m_baseline[m_baseline["product_name"] == product]
+                    day_df = m_success[m_success["txn_date"] == ta_day]
+                    if product is not None:
+                        day_df = day_df[day_df["product_name"] == product]
+
+                    grid = pd.MultiIndex.from_product(
+                        [_baseline_dates, range(24)], names=["date", "hour"]
+                    ).to_frame(index=False)
+                    actual = base.groupby([base["txn_date"], base["txn_datetime"].dt.hour]).size().reset_index()
+                    actual.columns = ["date", "hour", "count"]
+                    grid = grid.merge(actual, on=["date", "hour"], how="left")
+                    grid["count"] = grid["count"].fillna(0)
+                    baseline_median = grid.groupby("hour")["count"].median().reindex(range(24), fill_value=0)
+
+                    day_counts = day_df.groupby(day_df["txn_datetime"].dt.hour).size().reindex(range(24), fill_value=0)
+
+                    out = pd.DataFrame({
+                        "hour": range(24), "actual": day_counts.values, "baseline": baseline_median.values,
+                    })
+                    out["pct_of_normal"] = out.apply(
+                        lambda r: (r["actual"] / r["baseline"] * 100) if r["baseline"] > 0 else pd.NA, axis=1
+                    )
+                    out["flag"] = (out["baseline"] >= 2) & (out["actual"] <= out["baseline"] * 0.3)
+                    return out
+
+                st.markdown("**Overall (all products)**")
+                overall = _hourly_actual_vs_baseline()
+                chart_df = overall.melt(id_vars="hour", value_vars=["actual", "baseline"],
+                                         var_name="series", value_name="transactions")
+                chart_df["series"] = chart_df["series"].map({"actual": ta_day_choice, "baseline": "Baseline (median)"})
+                fig_ta = px.bar(
+                    chart_df, x="hour", y="transactions", color="series", barmode="group",
+                    title=f"Transactions by Hour — {ta_machine}",
+                    color_discrete_map={ta_day_choice: PRIMARY, "Baseline (median)": "#B0B8C1"},
+                )
+                fig_ta.update_layout(xaxis_title="Hour", yaxis_title="Transactions", xaxis=dict(dtick=1), legend_title="")
+                st.plotly_chart(fig_ta, use_container_width=True)
+
+                flagged_hours = overall[overall["flag"]]
+                if flagged_hours.empty:
+                    st.success(f"No unusually quiet hours detected for {ta_machine} on {ta_day_choice}. 🎉")
+                else:
+                    disp = flagged_hours[["hour", "actual", "baseline", "pct_of_normal"]].copy()
+                    disp["hour"] = disp["hour"].map(_fmt_hour)
+                    disp["pct_of_normal"] = disp["pct_of_normal"].map(
+                        lambda v: f"{v:.0f}%" if pd.notna(v) else "—"
+                    )
+                    st.warning(f"⚠️ {len(flagged_hours)} unusually quiet hour(s) found for {ta_machine} on {ta_day_choice}:")
+                    st.dataframe(
+                        disp.rename(columns={
+                            "hour": "Hour", "actual": "Transactions", "baseline": "Normal (median)",
+                            "pct_of_normal": "% of Normal",
+                        }),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                st.divider()
+                st.markdown("**Per Product (top 3 by revenue)**")
+                st.caption("Catches a single SKU/coil going quiet even while the machine overall looks fine.")
+                _top3_products = (
+                    m_success.groupby("product_name")["amount"].sum().sort_values(ascending=False).head(3).index.tolist()
+                )
+                if not _top3_products:
+                    st.info("No successful sales history for this machine to rank products by.")
+                else:
+                    ta_product = st.selectbox("Product", _top3_products, key="wendor_timing_product")
+                    per_sku = _hourly_actual_vs_baseline(ta_product)
+                    flagged_sku_hours = per_sku[per_sku["flag"]]
+
+                    sku_chart_df = per_sku.melt(id_vars="hour", value_vars=["actual", "baseline"],
+                                                 var_name="series", value_name="transactions")
+                    sku_chart_df["series"] = sku_chart_df["series"].map(
+                        {"actual": ta_day_choice, "baseline": "Baseline (median)"}
+                    )
+                    fig_sku = px.bar(
+                        sku_chart_df, x="hour", y="transactions", color="series", barmode="group",
+                        title=f"{ta_product} — Transactions by Hour — {ta_machine}",
+                        color_discrete_map={ta_day_choice: ACCENT, "Baseline (median)": "#B0B8C1"},
+                    )
+                    fig_sku.update_layout(xaxis_title="Hour", yaxis_title="Transactions", xaxis=dict(dtick=1), legend_title="")
+                    st.plotly_chart(fig_sku, use_container_width=True)
+
+                    if flagged_sku_hours.empty:
+                        st.success(f"No unusually quiet hours for {ta_product} on {ta_machine} ({ta_day_choice}). 🎉")
+                    else:
+                        sku_disp = flagged_sku_hours[["hour", "actual", "baseline", "pct_of_normal"]].copy()
+                        sku_disp["hour"] = sku_disp["hour"].map(_fmt_hour)
+                        sku_disp["pct_of_normal"] = sku_disp["pct_of_normal"].map(
+                            lambda v: f"{v:.0f}%" if pd.notna(v) else "—"
+                        )
+                        st.warning(
+                            f"⚠️ {len(flagged_sku_hours)} unusually quiet hour(s) for **{ta_product}** "
+                            f"on {ta_machine} ({ta_day_choice}):"
+                        )
+                        st.dataframe(
+                            sku_disp.rename(columns={
+                                "hour": "Hour", "actual": "Transactions", "baseline": "Normal (median)",
+                                "pct_of_normal": "% of Normal",
+                            }),
+                            use_container_width=True, hide_index=True,
+                        )
 
 
 # ============================================================
@@ -3110,6 +3604,8 @@ if SECTION == "Vendekin Snacks":
     render_vendekin_snacks()
 elif SECTION == "Vendekin-Nestle Coffee":
     render_nestle_coffee()
+elif SECTION == "Wendor Snacks":
+    render_wendor_snacks()
 elif SECTION == "Aggregate":
     render_aggregate()
 else:
