@@ -331,6 +331,59 @@ else:
 
 COFFEE_DATA_OK = COFFEE_LOAD_ERROR is None and not coffee_df.empty
 
+
+# ============================================================
+# SHARED: machine-wise revenue snapshot (Yesterday / D-2 / D-3 / 7d / 30d / lifetime)
+# ============================================================
+def machine_revenue_snapshot(daily_df: pd.DataFrame, id_cols: list, latest_date) -> pd.DataFrame:
+    """
+    Per-entity historical revenue snapshot: Yesterday, D-2, D-3, Last 7 Days avg,
+    Last 30 Days avg, Lifetime avg. Anchored strictly *before* `latest_date`, so
+    every period here is a complete day — no partial "today" to pace-adjust for.
+    `daily_df` needs one row per entity per day, with a "date" and "revenue" column.
+    Averages divide by the number of days each entity actually has data for in that
+    window, not a fixed day count, so a newer machine isn't understated.
+    """
+    cols = ["Yesterday", "D-2", "D-3", "Last 7d Avg", "Last 30d Avg", "Lifetime Avg"]
+    hist = daily_df[daily_df["date"] < latest_date]
+    if hist.empty:
+        return pd.DataFrame(columns=id_cols + cols)
+
+    def _day_value(offset):
+        day = latest_date - pd.Timedelta(days=offset)
+        return hist.loc[hist["date"] == day].groupby(id_cols)["revenue"].sum()
+
+    def _window_avg(days):
+        start = latest_date - pd.Timedelta(days=days)
+        end = latest_date - pd.Timedelta(days=1)
+        sub = hist[(hist["date"] >= start) & (hist["date"] <= end)]
+        g = sub.groupby(id_cols)
+        return g["revenue"].sum() / g["date"].nunique()
+
+    lifetime_g = hist.groupby(id_cols)
+    lifetime_avg = lifetime_g["revenue"].sum() / lifetime_g["date"].nunique()
+
+    out = pd.concat([
+        _day_value(1).rename("Yesterday"),
+        _day_value(2).rename("D-2"),
+        _day_value(3).rename("D-3"),
+        _window_avg(7).rename("Last 7d Avg"),
+        _window_avg(30).rename("Last 30d Avg"),
+        lifetime_avg.rename("Lifetime Avg"),
+    ], axis=1).reset_index()
+
+    for col in cols:
+        out[col] = out[col].fillna(0)
+    return out
+
+
+def _fmt_hour(h: int) -> str:
+    """0-23 -> a 12-hour clock label, e.g. 14 -> '2 PM'."""
+    period = "AM" if h < 12 else "PM"
+    h12 = h % 12 or 12
+    return f"{h12} {period}"
+
+
 def render_vendekin_snacks():
     if not SNACKS_DATA_OK:
         st.error(SNACKS_LOAD_ERROR)
@@ -620,6 +673,34 @@ def render_vendekin_snacks():
                 )
                 fig_top.update_layout(xaxis_title=metric_options[tp_metric], yaxis_title="")
                 st.plotly_chart(fig_top, use_container_width=True)
+
+        st.divider()
+
+        st.subheader("Machine-wise Revenue Snapshot")
+        st.caption(
+            "Yesterday, D-2, D-3, and rolling/lifetime averages, per machine — every period here "
+            "is a complete day (today is excluded), so there's nothing partial to adjust for."
+        )
+        _snack_daily_base = filter_dim(txn_daily_df)
+        _snack_latest = _snack_daily_base["date"].max()
+        if pd.isna(_snack_latest):
+            st.info("No transaction data available for the current City/Machine filters.")
+        else:
+            _snap = machine_revenue_snapshot(
+                _snack_daily_base, ["machine_id", "machine_name", "city", "location"], _snack_latest
+            )
+            if _snap.empty:
+                st.info("Not enough history yet (need at least a day before today).")
+            else:
+                _snap_disp = _snap.sort_values("Yesterday", ascending=False).drop(columns=["machine_id"])
+                for _col in ("Yesterday", "D-2", "D-3", "Last 7d Avg", "Last 30d Avg", "Lifetime Avg"):
+                    _snap_disp[_col] = _snap_disp[_col].map(lambda v: f"₹{v:,.0f}")
+                st.dataframe(
+                    _snap_disp.rename(columns={
+                        "machine_name": "Machine", "city": "City", "location": "Location",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
 
     # ---------- NEEDS ATTENTION ----------
     with tab_attention:
@@ -1091,6 +1172,49 @@ def render_vendekin_snacks():
             st.plotly_chart(fig_p, use_container_width=True)
             st.dataframe(
                 prod_agg.rename(columns={"product_name": "Product", "brand": "Brand", "sale_qty": "Units Sold", "revenue": "Revenue"}),
+                use_container_width=True, hide_index=True,
+            )
+
+        st.divider()
+
+        st.subheader("Machine-wise: Top 3 Products & Peak Timing")
+        st.caption(
+            "Each machine's top 3 products by revenue (`Txn_Product`) and its highest/lowest "
+            "revenue hour of day (`Txn_Hourly`), within the current filters."
+        )
+        if txn_product_f.empty or txn_hourly_f.empty:
+            st.info("Need both `Txn_Product` and `Txn_Hourly` data for the current filters.")
+        else:
+            _mp_rows = []
+            for _mid in sorted(txn_product_f["machine_id"].unique()):
+                _g = txn_product_f[txn_product_f["machine_id"] == _mid]
+                _top3 = _g.groupby("product_name")["revenue"].sum().sort_values(ascending=False).head(3)
+                _row = {"machine_id": _mid, "machine_name": _g["machine_name"].iloc[0]}
+                for _i in range(3):
+                    _row[f"Top {_i + 1}"] = (
+                        f"{_top3.index[_i]} (₹{_top3.iloc[_i]:,.0f})" if _i < len(_top3) else "—"
+                    )
+                _mp_rows.append(_row)
+            _mp_df = pd.DataFrame(_mp_rows)
+
+            _mh_rows = []
+            for _mid in sorted(txn_hourly_f["machine_id"].unique()):
+                _g = txn_hourly_f[txn_hourly_f["machine_id"] == _mid]
+                _by_hour = _g.groupby("hour")["revenue"].sum().reindex(range(24), fill_value=0)
+                _mh_rows.append({
+                    "machine_id": _mid,
+                    "Peak Hour": f"{_fmt_hour(int(_by_hour.idxmax()))} (₹{_by_hour.max():,.0f})",
+                    "Low Hour": f"{_fmt_hour(int(_by_hour.idxmin()))} (₹{_by_hour.min():,.0f})",
+                })
+            _mh_df = pd.DataFrame(_mh_rows)
+
+            _mp_combined = _mp_df.merge(_mh_df, on="machine_id", how="left")
+            _mp_combined = _mp_combined.merge(
+                machines_f[["machine_id", "city", "location"]].drop_duplicates(), on="machine_id", how="left"
+            )
+            st.dataframe(
+                _mp_combined[["machine_name", "city", "location", "Top 1", "Top 2", "Top 3", "Peak Hour", "Low Hour"]]
+                .rename(columns={"machine_name": "Machine", "city": "City", "location": "Location"}),
                 use_container_width=True, hide_index=True,
             )
 
@@ -2497,6 +2621,32 @@ def render_nestle_coffee():
             fig_top.update_layout(xaxis_title="Revenue (₹)", yaxis_title="")
             st.plotly_chart(fig_top, use_container_width=True)
 
+        st.divider()
+
+        st.subheader("Machine-wise Revenue Snapshot")
+        st.caption(
+            "Yesterday, D-2, D-3, and rolling/lifetime averages, per machine — every period here "
+            "is a complete day (today is excluded)."
+        )
+        _cf_latest = cf["txn_date"].max()
+        _cf_daily_by_machine = (
+            success.groupby(["machine_id", "machine_name", "city", success["txn_date"]])["amount"]
+            .sum().reset_index().rename(columns={"txn_date": "date", "amount": "revenue"})
+        )
+        _cf_snap = machine_revenue_snapshot(
+            _cf_daily_by_machine, ["machine_id", "machine_name", "city"], _cf_latest
+        )
+        if _cf_snap.empty:
+            st.info("Not enough history yet (need at least a day before today).")
+        else:
+            _cf_snap_disp = _cf_snap.sort_values("Yesterday", ascending=False).drop(columns=["machine_id"])
+            for _col in ("Yesterday", "D-2", "D-3", "Last 7d Avg", "Last 30d Avg", "Lifetime Avg"):
+                _cf_snap_disp[_col] = _cf_snap_disp[_col].map(lambda v: f"₹{v:,.0f}")
+            st.dataframe(
+                _cf_snap_disp.rename(columns={"machine_name": "Machine", "city": "City"}),
+                use_container_width=True, hide_index=True,
+            )
+
     with tab_cf_revenue:
         rv_c1, rv_c2 = st.columns(2)
         with rv_c1:
@@ -2537,6 +2687,36 @@ def render_nestle_coffee():
                 prod_agg.rename(columns={
                     "product_name": "Product", "units_sold": "Units Sold", "revenue": "Revenue",
                 }),
+                use_container_width=True, hide_index=True,
+            )
+
+        st.divider()
+
+        st.subheader("Machine-wise: Top 3 Products & Peak Timing")
+        st.caption(
+            "Each machine's top 3 products by revenue and its highest/lowest revenue hour of "
+            "day, from real transaction timestamps, within the current filters."
+        )
+        if success.empty:
+            st.info("No successful sales for the current filters.")
+        else:
+            _cf_mp_rows = []
+            for _mid in sorted(success["machine_id"].unique()):
+                _g = success[success["machine_id"] == _mid]
+                _top3 = _g.groupby("product_name")["amount"].sum().sort_values(ascending=False).head(3)
+                _row = {"machine_id": _mid, "machine_name": _g["machine_name"].iloc[0], "city": _g["city"].iloc[0]}
+                for _i in range(3):
+                    _row[f"Top {_i + 1}"] = (
+                        f"{_top3.index[_i]} (₹{_top3.iloc[_i]:,.0f})" if _i < len(_top3) else "—"
+                    )
+                _by_hour = _g.groupby(_g["txn_ts"].dt.hour)["amount"].sum().reindex(range(24), fill_value=0)
+                _row["Peak Hour"] = f"{_fmt_hour(int(_by_hour.idxmax()))} (₹{_by_hour.max():,.0f})"
+                _row["Low Hour"] = f"{_fmt_hour(int(_by_hour.idxmin()))} (₹{_by_hour.min():,.0f})"
+                _cf_mp_rows.append(_row)
+            _cf_mp_df = pd.DataFrame(_cf_mp_rows)
+            st.dataframe(
+                _cf_mp_df[["machine_name", "city", "Top 1", "Top 2", "Top 3", "Peak Hour", "Low Hour"]]
+                .rename(columns={"machine_name": "Machine", "city": "City"}),
                 use_container_width=True, hide_index=True,
             )
 
@@ -2698,6 +2878,50 @@ def render_aggregate():
     summary_display["Total Revenue"] = summary_display["Total Revenue"].map(lambda v: f"₹{v:,.0f}")
     summary_display["Total Units"] = summary_display["Total Units"].map(lambda v: f"{v:,.0f}")
     st.dataframe(summary_display, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Machine-wise Revenue Snapshot — All Connected Lines")
+    st.caption(
+        "Yesterday, D-2, D-3, and rolling/lifetime averages, per machine, across every "
+        "connected line. Each brand is anchored to its own latest date, since the two "
+        "data sources don't necessarily update at the same cadence."
+    )
+    snap_frames = []
+    if SNACKS_DATA_OK:
+        _s_latest = txn_daily_df["date"].max()
+        _s_snap = machine_revenue_snapshot(
+            txn_daily_df, ["machine_id", "machine_name", "city"], _s_latest
+        )
+        if not _s_snap.empty:
+            _s_snap.insert(0, "Brand", "Vendekin Snacks")
+            snap_frames.append(_s_snap)
+    if COFFEE_DATA_OK:
+        _c_success = coffee_df[coffee_df["dispense_ok"] == True]  # noqa: E712
+        _c_latest = coffee_df["txn_date"].max()
+        _c_daily_by_machine = (
+            _c_success.groupby(["machine_id", "machine_name", "city", _c_success["txn_date"]])["amount"]
+            .sum().reset_index().rename(columns={"txn_date": "date", "amount": "revenue"})
+        )
+        _c_snap = machine_revenue_snapshot(
+            _c_daily_by_machine, ["machine_id", "machine_name", "city"], _c_latest
+        )
+        if not _c_snap.empty:
+            _c_snap.insert(0, "Brand", "Vendekin-Nestle Coffee")
+            snap_frames.append(_c_snap)
+
+    if not snap_frames:
+        st.info("No connected line has enough history yet (need at least a day before today).")
+    else:
+        combined_snap = pd.concat(snap_frames, ignore_index=True).sort_values(
+            ["Brand", "Yesterday"], ascending=[True, False]
+        )
+        combined_disp = combined_snap.drop(columns=["machine_id"])
+        for _col in ("Yesterday", "D-2", "D-3", "Last 7d Avg", "Last 30d Avg", "Lifetime Avg"):
+            combined_disp[_col] = combined_disp[_col].map(lambda v: f"₹{v:,.0f}")
+        st.dataframe(
+            combined_disp.rename(columns={"machine_name": "Machine", "city": "City"}),
+            use_container_width=True, hide_index=True,
+        )
 
 
 # ============================================================
