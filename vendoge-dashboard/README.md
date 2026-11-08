@@ -105,6 +105,27 @@ from `machine_name` (the token right after the numeric machine ID, e.g.
 just show an info message instead of erroring — the other sections keep
 working regardless.
 
+### Optional: Wendor Snacks
+
+The **Wendor Snacks** section reads another separate sheet of raw,
+per-transaction rows (`txn_date`, `txn_datetime`, `order_id`, `txn_id`,
+`machine_id`, `machine_name`, `product_name`, `quantity`, `mrp`,
+`paid_price`, `amount`, `payment_status`, `vend_status`, `vend_comment`,
+`is_sale`, ...). If you use it, add:
+
+```toml
+[sheets]
+dashboard = "..."
+wendor_snacks = "PASTE_THE_WENDOR_SHEET_ID_HERE"
+
+[gids.wendor_snacks]
+transactions = "PASTE_THE_TRANSACTIONS_TAB_GID_HERE"
+```
+
+Unlike Coffee, this sheet has no city/location field at all, so the
+Wendor section has no City filter. Leave this out and the Wendor section
+will just show an info message instead of erroring.
+
 ---
 
 ## 2. Run it locally first (recommended before deploying)
@@ -231,8 +252,8 @@ Snapshot** — see below — across every machine on every connected line.
 
 ### Machine-wise Revenue Snapshot
 
-Every section (Aggregate, Vendekin Snacks, Vendekin-Nestle Coffee) has a
-per-machine table: **Yesterday, D-2, D-3, Last 7 Days avg, Last 30 Days
+Every section (Aggregate, Vendekin Snacks, Vendekin-Nestle Coffee, Wendor
+Snacks) has a per-machine table: **Yesterday, D-2, D-3, Last 7 Days avg, Last 30 Days
 avg, Lifetime avg**. It's anchored strictly before today, so every figure
 is a complete day — nothing here needs the pace-adjustment the Today tab
 uses. The rolling/lifetime averages divide by how many days of data each
@@ -319,11 +340,43 @@ there's no refill or product-category data for this line yet.
   Snacks' sheet is pre-aggregated (no per-day-hour or per-transaction
   data), so this can't be built there until that changes.
 
-### Wendor Snacks / Eazyvend Protein
+### Wendor Snacks
 
-Placeholders for now — each shows an info message until a data source is
+Built from raw per-transaction rows, same as Coffee. No city — and no
+location of any kind — is recorded in this sheet, so there's no City
+filter or dimension for this line; everything is by machine only.
+`quantity` is always 1 per row (a multi-unit purchase shows up as
+multiple rows sharing the same `txn_id`), so one row = one unit sold.
+A transaction counts as a sale when `is_sale` is true (equivalently,
+`vend_status == "completed"`); failures are further split into
+**refunded** (the customer got their money back) and **lost** (paid,
+not dispensed, not refunded) using `payment_status`.
+
+- **Sidebar filters:** date range, machine
+- **KPI row:** total revenue, units sold, average daily revenue, machines
+  in view, failure rate
+- **Overview tab:** daily revenue trend, top machines by revenue, and the
+  Machine-wise Revenue Snapshot (see above)
+- **Revenue & Products tab:** daily revenue, revenue by hour of day (real
+  timestamps), top products by revenue, and the machine-wise top-3-
+  products/peak-timing breakdown
+- **Failures tab:** failed-transaction count, amount lost vs. refunded,
+  trend by day, top machines by amount at risk, and a breakdown by
+  failure reason (`vend_comment`, e.g. `VEND_FAILED_NUDGE_MAXED` — the
+  machine tried to dispense and the nudge motor maxed out, a literal
+  stuck-coil symptom) — plus the full failure log
+- **Machines tab:** directory derived from the transaction log itself
+  with revenue, units, and failure rate per machine
+- **Timing Anomalies tab:** same mechanic as Coffee's — pick a machine
+  and a day (Today / D-1 / D-2), compare that day's hour-by-hour
+  transaction count against the machine's own 30-day baseline for that
+  hour, overall and per top-3 product
+
+### Eazyvend Protein
+
+Placeholder for now — shows an info message until a data source is
 connected. Once one is, it picks up the same kind of views as the other
-two lines and starts showing up in Aggregate.
+lines and starts showing up in Aggregate.
 
 ---
 
