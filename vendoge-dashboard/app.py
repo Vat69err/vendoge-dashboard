@@ -12,6 +12,7 @@ Configure the sheet ID in Streamlit secrets (see README.md):
 dashboard = "YOUR_GOOGLE_SHEET_ID"
 """
 
+import re
 from datetime import timedelta
 from urllib.parse import quote
 
@@ -376,6 +377,217 @@ else:
 
 WENDOR_DATA_OK = WENDOR_LOAD_ERROR is None and not wendor_df.empty
 
+# ============================================================
+# 2d. MARGIN / COGS REFERENCE DATA — cost-basis sheets for Snacks/Wendor and Coffee
+# ============================================================
+MARGIN_SHEET_ID = st.secrets.get("sheets", {}).get("margin_cogs")
+MARGIN_SNACKS_WENDOR_GID = (
+    str(st.secrets.get("gids", {}).get("margin_cogs", {}).get("snacks_wendor", ""))
+    if MARGIN_SHEET_ID else ""
+)
+MARGIN_COFFEE_GID = (
+    str(st.secrets.get("gids", {}).get("margin_cogs", {}).get("coffee", ""))
+    if MARGIN_SHEET_ID else ""
+)
+
+
+def _margin_csv_url(gid: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{MARGIN_SHEET_ID}/export?format=csv&gid={gid}"
+
+
+# ---- Snacks / Wendor: a running distributor-invoice ledger, one row per delivery ----
+# (many rows per SKU over time as distributors/costs change). We match a raw
+# transaction product_name against it by increasingly loose normalization, but never
+# by guessing past a disagreeing price: "Diet Coke Can Rs 30" and "...Rs 50" are
+# different SKUs, not noise, so an explicit price in the name must agree with the
+# candidate's own price before it's accepted.
+_SKU_PRICE_RE = re.compile(r"\brs\s*(\d+)\s*$")
+
+
+def _sku_basic_norm(name) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(name).lower())).strip()
+
+
+def _sku_extract_price(norm: str):
+    m = _SKU_PRICE_RE.search(norm)
+    return int(m.group(1)) if m else None
+
+
+def _sku_strip_price(norm: str) -> str:
+    return _SKU_PRICE_RE.sub("", norm).strip()
+
+
+@st.cache_data(ttl=300, show_spinner="Pulling latest Snacks/Wendor cost data...")
+def load_snacks_wendor_cost_lookup() -> pd.DataFrame:
+    """
+    One row per SKU Canon Name with its most-recently-dated unit cost. `unit_cost` is
+    Rate Per Packet Inclusive GST — the cost of a single vended packet, GST-inclusive,
+    directly comparable to the GST-inclusive price a customer actually pays.
+    """
+    df = pd.read_csv(_margin_csv_url(MARGIN_SNACKS_WENDOR_GID))
+    df = df[df["SKU Canon Name"].notna() & df["Rate Per Packet Inclusive GST"].notna()].copy()
+    df["unit_cost"] = pd.to_numeric(df["Rate Per Packet Inclusive GST"], errors="coerce")
+    df = df[df["unit_cost"].notna()]
+
+    order_date = pd.to_datetime(df.get("Date of Order/Delivery"), errors="coerce")
+    insert_date = pd.to_datetime(df.get("Insert Date"), errors="coerce")
+    df["_as_of"] = order_date.fillna(insert_date).fillna(pd.Timestamp.min)
+
+    df = df.sort_values("_as_of").groupby("SKU Canon Name", as_index=False).last()
+    df = df[["SKU Canon Name", "unit_cost", "_as_of"]].rename(
+        columns={"SKU Canon Name": "sku_canon_name", "_as_of": "as_of_date"}
+    )
+    df["full_norm"] = df["sku_canon_name"].apply(_sku_basic_norm)
+    df["price"] = df["full_norm"].apply(_sku_extract_price)
+    df["price_stripped"] = df["full_norm"].apply(_sku_strip_price)
+    df["squash"] = df["price_stripped"].str.replace(" ", "", regex=False)
+    return df
+
+
+if MARGIN_SHEET_ID and MARGIN_SNACKS_WENDOR_GID:
+    try:
+        snacks_wendor_cost_df = load_snacks_wendor_cost_lookup()
+        MARGIN_SNACKS_WENDOR_LOAD_ERROR = None
+    except Exception as e:
+        snacks_wendor_cost_df = pd.DataFrame()
+        MARGIN_SNACKS_WENDOR_LOAD_ERROR = f"Couldn't load the Snacks/Wendor cost sheet.\n\nTechnical detail: {e}"
+else:
+    snacks_wendor_cost_df = pd.DataFrame()
+    MARGIN_SNACKS_WENDOR_LOAD_ERROR = (
+        "Missing secrets! Margin/COGS needs `[sheets] margin_cogs` (the sheet ID) and "
+        "`[gids.margin_cogs] snacks_wendor` (the tab's gid) set up in Streamlit secrets."
+    )
+
+MARGIN_SNACKS_WENDOR_DATA_OK = MARGIN_SNACKS_WENDOR_LOAD_ERROR is None and not snacks_wendor_cost_df.empty
+
+
+def match_snacks_cost(product_names: list, cost_df: pd.DataFrame) -> dict:
+    """Map each raw product_name to a unit_cost from the Snacks/Wendor cost ledger, or
+    None if nothing can be matched with confidence."""
+    if cost_df.empty:
+        return {name: None for name in product_names}
+
+    full_map = {}
+    for n, c in zip(cost_df["full_norm"], cost_df["unit_cost"]):
+        full_map.setdefault(n, set()).add(round(c, 2))
+
+    stripped_groups, squash_groups = {}, {}
+    for n, c, p in zip(cost_df["price_stripped"], cost_df["unit_cost"], cost_df["price"]):
+        stripped_groups.setdefault(n, []).append((round(c, 2), p))
+    for n, c, p in zip(cost_df["squash"], cost_df["unit_cost"], cost_df["price"]):
+        squash_groups.setdefault(n, []).append((round(c, 2), p))
+
+    def _resolve(pairs, query_price):
+        """If the query names an explicit price, a candidate must share that exact
+        price to be used at all — a disagreeing price means a different SKU variant,
+        not noise to average over."""
+        if query_price is not None:
+            same_price = {c for c, p in pairs if p == query_price}
+            return next(iter(same_price)) if len(same_price) == 1 else None
+        uniq_costs = {c for c, _ in pairs}
+        return next(iter(uniq_costs)) if len(uniq_costs) == 1 else None
+
+    out = {}
+    for name in product_names:
+        full = _sku_basic_norm(name)
+        q_price = _sku_extract_price(full)
+        stripped = _sku_strip_price(full)
+        sq = stripped.replace(" ", "")
+
+        costs = full_map.get(full)
+        if costs and len(costs) == 1:
+            out[name] = next(iter(costs))
+            continue
+
+        pairs = stripped_groups.get(stripped)
+        if pairs:
+            out[name] = _resolve(pairs, q_price)
+            continue
+
+        pairs = squash_groups.get(sq)
+        out[name] = _resolve(pairs, q_price) if pairs else None
+    return out
+
+
+# ---- Coffee: Section 1 of the "Duo Gusto Costs" sheet is a clean per-beverage cost
+# table embedded inside a longer, human-readable report. We locate it by its header
+# row rather than assuming a fixed row count, so edits to the sheet (new beverages,
+# re-ordered rows) don't need a code change. Beverages with no recipe/cost basis
+# (per the sheet's own notes, e.g. Shikanji, Masala Chai) simply won't appear here,
+# so they're correctly treated as "no cost data" rather than zero-cost. ----
+COFFEE_SOLD_NAME_ALIAS = {
+    "cafe frappe": "cold coffee",
+    "frappe mocha": "mocha frappe",
+    "ls cold coffee": "lower sugar cold coffee",
+    "lemon tea": "hot lemon tea",
+}
+
+
+def _coffee_name_norm(name) -> str:
+    s = str(name).lower().strip()
+    s = s.replace("é", "e").replace("è", "e")
+    return re.sub(r"\s+", " ", s)
+
+
+@st.cache_data(ttl=300, show_spinner="Pulling latest Coffee cost data...")
+def load_coffee_cost_lookup() -> pd.DataFrame:
+    raw = pd.read_csv(_margin_csv_url(MARGIN_COFFEE_GID), header=None)
+    header_rows = raw.index[raw[0].astype(str).str.strip().str.lower() == "beverage"]
+    if len(header_rows) == 0:
+        return pd.DataFrame(columns=["beverage", "norm", "unit_cost"])
+    start = header_rows[0] + 1
+
+    cost_col = 2  # observed layout: Beverage, Premix Used, Fully-Loaded Cost/Cup, ...
+    header_vals = raw.loc[header_rows[0]].astype(str).str.lower()
+    for idx, val in header_vals.items():
+        if "fully-loaded" in val and "cost" in val:
+            cost_col = idx
+            break
+
+    rows = []
+    for i in range(start, len(raw)):
+        name = str(raw.iat[i, 0]).strip()
+        if not name or name.lower() == "nan" or "mapping note" in name.lower():
+            break
+        cost = pd.to_numeric(re.sub(r"[^\d.]", "", str(raw.iat[i, cost_col])), errors="coerce")
+        if pd.isna(cost):
+            break
+        rows.append({"beverage": name, "unit_cost": float(cost)})
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["norm"] = out["beverage"].apply(_coffee_name_norm)
+    return out
+
+
+if MARGIN_SHEET_ID and MARGIN_COFFEE_GID:
+    try:
+        coffee_cost_df = load_coffee_cost_lookup()
+        MARGIN_COFFEE_LOAD_ERROR = None if not coffee_cost_df.empty else "The Coffee cost sheet loaded but no beverages were found in it."
+    except Exception as e:
+        coffee_cost_df = pd.DataFrame()
+        MARGIN_COFFEE_LOAD_ERROR = f"Couldn't load the Coffee cost sheet.\n\nTechnical detail: {e}"
+else:
+    coffee_cost_df = pd.DataFrame()
+    MARGIN_COFFEE_LOAD_ERROR = (
+        "Missing secrets! Margin/COGS needs `[sheets] margin_cogs` (the sheet ID) and "
+        "`[gids.margin_cogs] coffee` (the tab's gid) set up in Streamlit secrets."
+    )
+
+MARGIN_COFFEE_DATA_OK = MARGIN_COFFEE_LOAD_ERROR is None and not coffee_cost_df.empty
+
+
+def match_coffee_cost(product_names: list, cost_df: pd.DataFrame) -> dict:
+    if cost_df.empty:
+        return {name: None for name in product_names}
+    cost_map = dict(zip(cost_df["norm"], cost_df["unit_cost"]))
+    out = {}
+    for name in product_names:
+        n = _coffee_name_norm(name)
+        n = COFFEE_SOLD_NAME_ALIAS.get(n, n)
+        out[name] = cost_map.get(n)
+    return out
+
 
 # ============================================================
 # SHARED: machine-wise revenue snapshot (Yesterday / D-2 / D-3 / 7d / 30d / lifetime)
@@ -427,6 +639,95 @@ def _fmt_hour(h: int) -> str:
     period = "AM" if h < 12 else "PM"
     h12 = h % 12 or 12
     return f"{h12} {period}"
+
+
+def _price_products(agg: pd.DataFrame, cost_df: pd.DataFrame, match_fn) -> pd.DataFrame:
+    """Adds unit_cost/cogs/margin_rs/margin_pct to a (product_name, sold_qty, revenue) table."""
+    out = agg.copy()
+    if cost_df.empty or out.empty:
+        out["unit_cost"] = pd.NA
+        out["cogs"] = pd.NA
+        out["margin_rs"] = pd.NA
+        out["margin_pct"] = pd.NA
+        return out
+    names = out["product_name"].dropna().unique().tolist()
+    cost_map = match_fn(names, cost_df)
+    out["unit_cost"] = out["product_name"].map(cost_map)
+    out["cogs"] = out["unit_cost"] * out["sold_qty"]
+    out["margin_rs"] = out["revenue"] - out["cogs"]
+    out["margin_pct"] = (out["margin_rs"] / out["revenue"] * 100).where(out["revenue"] > 0)
+    return out
+
+
+def render_margin_cogs_tab(agg: pd.DataFrame, cost_df: pd.DataFrame, match_fn, data_ok: bool,
+                            load_error: str, source_label: str):
+    """
+    `agg` needs one row per product with product_name/sold_qty/revenue already
+    aggregated by the caller for whatever scope is on screen. Margin is blended only
+    over revenue we could actually price — silently averaging in unpriced SKUs at an
+    assumed cost would misstate the real number, so the coverage gap stays visible
+    instead of guessed away.
+    """
+    st.caption(
+        f"Cost basis: **{source_label}** cost sheet. Only SKUs matched with confidence are "
+        "priced — everything else is listed separately as unpriced, not assumed zero-cost."
+    )
+    if not data_ok:
+        st.warning(f"Cost data isn't loaded ({load_error}) — margin/COGS can't be shown yet.")
+        return
+    if agg.empty:
+        st.info("No product-level data for the current filters.")
+        return
+
+    priced = _price_products(agg, cost_df, match_fn)
+    matched = priced[priced["unit_cost"].notna()]
+    total_revenue = priced["revenue"].sum()
+    matched_revenue = matched["revenue"].sum()
+    coverage_pct = (matched_revenue / total_revenue * 100) if total_revenue else 0.0
+    blended_margin_pct = (matched["margin_rs"].sum() / matched_revenue * 100) if matched_revenue else None
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Cost Data Coverage", f"{coverage_pct:.0f}% of revenue")
+    c2.metric("Blended Gross Margin %", f"{blended_margin_pct:.1f}%" if blended_margin_pct is not None else "—",
+               help="Over priced SKUs only — see coverage above.")
+    c3.metric("Gross Profit (priced SKUs)", f"₹{matched['margin_rs'].sum():,.0f}" if not matched.empty else "₹0")
+
+    if 0 < coverage_pct < 100:
+        st.caption(f"⚠️ {100 - coverage_pct:.0f}% of revenue is from SKUs with no matched cost yet.")
+
+    st.divider()
+    if not matched.empty:
+        top_rev = matched.sort_values("revenue", ascending=False).head(20)
+        fig = px.bar(
+            top_rev.sort_values("revenue"), x="revenue", y="product_name", orientation="h",
+            color="margin_pct", color_continuous_scale=[ACCENT, PRIMARY],
+            title="Top 20 Priced Products by Revenue, colored by Margin %",
+        )
+        fig.update_layout(xaxis_title="Revenue (₹)", yaxis_title="")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(
+            matched.sort_values("revenue", ascending=False)[
+                ["product_name", "sold_qty", "revenue", "unit_cost", "cogs", "margin_rs", "margin_pct"]
+            ].rename(columns={
+                "product_name": "Product", "sold_qty": "Units Sold", "revenue": "Revenue",
+                "unit_cost": "Unit Cost (₹)", "cogs": "COGS (₹)", "margin_rs": "Gross Margin (₹)",
+                "margin_pct": "Gross Margin (%)",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.info("None of the current products matched the cost sheet.")
+
+    unmatched = priced[priced["unit_cost"].isna()].sort_values("revenue", ascending=False)
+    if not unmatched.empty:
+        with st.expander(f"Unpriced products ({len(unmatched)} SKUs, ₹{unmatched['revenue'].sum():,.0f} revenue)"):
+            st.dataframe(
+                unmatched[["product_name", "sold_qty", "revenue"]].rename(columns={
+                    "product_name": "Product", "sold_qty": "Units Sold", "revenue": "Revenue",
+                }),
+                use_container_width=True, hide_index=True,
+            )
 
 
 def render_vendekin_snacks():
@@ -657,9 +958,10 @@ def render_vendekin_snacks():
     # 6. TABS
     # ============================================================
     (tab_overview, tab_attention, tab_today, tab_revenue, tab_refill, tab_failures, tab_sku,
-     tab_machines, tab_outliers, tab_accounts, tab_hr) = st.tabs([
+     tab_machines, tab_outliers, tab_margin, tab_accounts, tab_hr) = st.tabs([
         "📊 Overview", "🚨 Needs Attention", "📅 Today", "💰 Revenue & Sales", "🔁 Refilling",
-        "🚫 Failures", "🧃 SKU Mix", "🖥️ Machines", "⚠️ Outliers", "💳 Accounts", "👥 HR",
+        "🚫 Failures", "🧃 SKU Mix", "🖥️ Machines", "⚠️ Outliers", "📈 Margin & COGS",
+        "💳 Accounts", "👥 HR",
     ])
 
     # ---------- OVERVIEW ----------
@@ -1620,6 +1922,22 @@ def render_vendekin_snacks():
                         }),
                         use_container_width=True, hide_index=True,
                     )
+
+    with tab_margin:
+        st.subheader("📈 Margin & COGS")
+        st.caption(
+            "Fleet-wide (same scope as the SKU Mix tab — not affected by the sidebar date/city/machine filters)."
+        )
+        sku_cat_df = data["sku_category_map"]
+        if sku_cat_df.empty:
+            st.info("No `SKU_Category_Map` data loaded.")
+        else:
+            margin_agg = sku_cat_df.groupby("product_name", as_index=False)[["sold_qty", "revenue"]].sum()
+            render_margin_cogs_tab(
+                margin_agg, snacks_wendor_cost_df, match_snacks_cost,
+                MARGIN_SNACKS_WENDOR_DATA_OK, MARGIN_SNACKS_WENDOR_LOAD_ERROR,
+                "Distributors × SKU × Margin",
+            )
 
     with tab_accounts:
         st.subheader("💳 Accounts Ledger")
@@ -2640,8 +2958,9 @@ def render_nestle_coffee():
 
     st.divider()
 
-    tab_cf_overview, tab_cf_revenue, tab_cf_failures, tab_cf_machines, tab_cf_timing = st.tabs(
-        ["📊 Overview", "💰 Revenue & Products", "🚫 Failures", "🖥️ Machines", "⏱️ Timing Anomalies"]
+    tab_cf_overview, tab_cf_revenue, tab_cf_failures, tab_cf_machines, tab_cf_timing, tab_cf_margin = st.tabs(
+        ["📊 Overview", "💰 Revenue & Products", "🚫 Failures", "🖥️ Machines", "⏱️ Timing Anomalies",
+         "📈 Margin & COGS"]
     )
 
     with tab_cf_overview:
@@ -2987,6 +3306,16 @@ def render_nestle_coffee():
                             use_container_width=True, hide_index=True,
                         )
 
+    with tab_cf_margin:
+        st.subheader("📈 Margin & COGS")
+        margin_agg = success.groupby("product_name", as_index=False).agg(
+            sold_qty=("qty", "sum"), revenue=("amount", "sum"),
+        )
+        render_margin_cogs_tab(
+            margin_agg, coffee_cost_df, match_coffee_cost,
+            MARGIN_COFFEE_DATA_OK, MARGIN_COFFEE_LOAD_ERROR, "Duo Gusto Costs",
+        )
+
 
 # ============================================================
 # AGGREGATE SECTION
@@ -2998,6 +3327,12 @@ def render_aggregate():
         "yet show as Not Connected rather than being silently left out."
     )
 
+    def _blended_margin_pct(agg: pd.DataFrame, cost_df: pd.DataFrame, match_fn):
+        priced = _price_products(agg, cost_df, match_fn)
+        matched = priced[priced["unit_cost"].notna()]
+        rev = matched["revenue"].sum()
+        return (matched["margin_rs"].sum() / rev * 100) if rev else None
+
     brand_rows = []
     daily_frames = []
 
@@ -3005,17 +3340,19 @@ def render_aggregate():
         s_daily = txn_daily_df.groupby("date", as_index=False)["revenue"].sum()
         s_daily["brand"] = "Vendekin Snacks"
         daily_frames.append(s_daily[["date", "revenue", "brand"]])
+        s_margin_agg = data["sku_category_map"].groupby("product_name", as_index=False)[["sold_qty", "revenue"]].sum()
         brand_rows.append({
             "Brand": "Vendekin Snacks", "Status": "Connected",
             "Total Revenue": txn_daily_df["revenue"].sum(),
             "Total Units": txn_daily_df["sale_qty"].sum(),
             "Machines": txn_daily_df["machine_id"].nunique(),
             "Date Range": f"{txn_daily_df['date'].min().date()} → {txn_daily_df['date'].max().date()}",
+            "Blended Margin %": _blended_margin_pct(s_margin_agg, snacks_wendor_cost_df, match_snacks_cost),
         })
     else:
         brand_rows.append({
             "Brand": "Vendekin Snacks", "Status": "Not Connected",
-            "Total Revenue": 0.0, "Total Units": 0, "Machines": 0, "Date Range": "—",
+            "Total Revenue": 0.0, "Total Units": 0, "Machines": 0, "Date Range": "—", "Blended Margin %": None,
         })
 
     if COFFEE_DATA_OK:
@@ -3025,17 +3362,21 @@ def render_aggregate():
         c_daily["date"] = pd.to_datetime(c_daily["date"])
         c_daily["brand"] = "Vendekin-Nestle Coffee"
         daily_frames.append(c_daily[["date", "revenue", "brand"]])
+        c_margin_agg = c_success.groupby("product_name", as_index=False).agg(
+            sold_qty=("qty", "sum"), revenue=("amount", "sum"),
+        )
         brand_rows.append({
             "Brand": "Vendekin-Nestle Coffee", "Status": "Connected",
             "Total Revenue": c_success["amount"].sum(),
             "Total Units": c_success["qty"].sum(),
             "Machines": coffee_df["machine_id"].nunique(),
             "Date Range": f"{coffee_df['txn_date'].min().date()} → {coffee_df['txn_date'].max().date()}",
+            "Blended Margin %": _blended_margin_pct(c_margin_agg, coffee_cost_df, match_coffee_cost),
         })
     else:
         brand_rows.append({
             "Brand": "Vendekin-Nestle Coffee", "Status": "Not Connected",
-            "Total Revenue": 0.0, "Total Units": 0, "Machines": 0, "Date Range": "—",
+            "Total Revenue": 0.0, "Total Units": 0, "Machines": 0, "Date Range": "—", "Blended Margin %": None,
         })
 
     if WENDOR_DATA_OK:
@@ -3045,22 +3386,26 @@ def render_aggregate():
         w_daily["date"] = pd.to_datetime(w_daily["date"])
         w_daily["brand"] = "Wendor Snacks"
         daily_frames.append(w_daily[["date", "revenue", "brand"]])
+        w_margin_agg = w_success.groupby("product_name", as_index=False).agg(
+            sold_qty=("product_name", "size"), revenue=("amount", "sum"),
+        )
         brand_rows.append({
             "Brand": "Wendor Snacks", "Status": "Connected",
             "Total Revenue": w_success["amount"].sum(),
             "Total Units": len(w_success),
             "Machines": wendor_df["machine_id"].nunique(),
             "Date Range": f"{wendor_df['txn_date'].min().date()} → {wendor_df['txn_date'].max().date()}",
+            "Blended Margin %": _blended_margin_pct(w_margin_agg, snacks_wendor_cost_df, match_snacks_cost),
         })
     else:
         brand_rows.append({
             "Brand": "Wendor Snacks", "Status": "Not Connected",
-            "Total Revenue": 0.0, "Total Units": 0, "Machines": 0, "Date Range": "—",
+            "Total Revenue": 0.0, "Total Units": 0, "Machines": 0, "Date Range": "—", "Blended Margin %": None,
         })
 
     brand_rows.append({
         "Brand": "Eazyvend Protein", "Status": "Not Connected",
-        "Total Revenue": 0.0, "Total Units": 0, "Machines": 0, "Date Range": "—",
+        "Total Revenue": 0.0, "Total Units": 0, "Machines": 0, "Date Range": "—", "Blended Margin %": None,
     })
 
     total_revenue = sum(b["Total Revenue"] for b in brand_rows)
@@ -3091,7 +3436,14 @@ def render_aggregate():
     summary_display = summary_df.copy()
     summary_display["Total Revenue"] = summary_display["Total Revenue"].map(lambda v: f"₹{v:,.0f}")
     summary_display["Total Units"] = summary_display["Total Units"].map(lambda v: f"{v:,.0f}")
+    summary_display["Blended Margin %"] = summary_display["Blended Margin %"].map(
+        lambda v: f"{v:.1f}%" if pd.notna(v) else "—"
+    )
     st.dataframe(summary_display, use_container_width=True, hide_index=True)
+    st.caption(
+        "Blended Margin % is over cost-matched revenue only within each brand — see that "
+        "brand's own Margin & COGS tab for coverage."
+    )
 
     st.divider()
     st.subheader("Machine-wise Revenue Snapshot — All Connected Lines")
@@ -3213,8 +3565,9 @@ def render_wendor_snacks():
 
     st.divider()
 
-    tab_wd_overview, tab_wd_revenue, tab_wd_failures, tab_wd_machines, tab_wd_timing = st.tabs(
-        ["📊 Overview", "💰 Revenue & Products", "🚫 Failures", "🖥️ Machines", "⏱️ Timing Anomalies"]
+    tab_wd_overview, tab_wd_revenue, tab_wd_failures, tab_wd_machines, tab_wd_timing, tab_wd_margin = st.tabs(
+        ["📊 Overview", "💰 Revenue & Products", "🚫 Failures", "🖥️ Machines", "⏱️ Timing Anomalies",
+         "📈 Margin & COGS"]
     )
 
     with tab_wd_overview:
@@ -3566,6 +3919,17 @@ def render_wendor_snacks():
                             }),
                             use_container_width=True, hide_index=True,
                         )
+
+    with tab_wd_margin:
+        st.subheader("📈 Margin & COGS")
+        margin_agg = success.groupby("product_name", as_index=False).agg(
+            sold_qty=("product_name", "size"), revenue=("amount", "sum"),
+        )
+        render_margin_cogs_tab(
+            margin_agg, snacks_wendor_cost_df, match_snacks_cost,
+            MARGIN_SNACKS_WENDOR_DATA_OK, MARGIN_SNACKS_WENDOR_LOAD_ERROR,
+            "Distributors × SKU × Margin",
+        )
 
 
 # ============================================================
