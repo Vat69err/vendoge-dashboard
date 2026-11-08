@@ -1,8 +1,15 @@
 # Vendoge Operations Dashboard
 
-A Streamlit dashboard that reads live data straight from your Google Sheet
+A Streamlit dashboard that reads live data straight from your Google Sheets
 (no manual exports, no re-uploading files) and shows revenue, refilling, SKU
 mix, and dispense-failure trends across your machines.
+
+The dashboard covers five machine lines, picked from a **Section** dropdown
+in the sidebar: **Aggregate** (combined across every connected line),
+**Vendekin Snacks**, **Vendekin-Nestle Coffee**, **Wendor Snacks**, and
+**Eazyvend Protein**. Only Vendekin Snacks and Vendekin-Nestle Coffee have a
+data source today — the other two show a placeholder until their sheets are
+connected.
 
 This guide assumes you've never deployed a Streamlit app before. Follow it
 top to bottom.
@@ -73,6 +80,30 @@ accounts = "PASTE_THE_ACCOUNTS_TAB_GID_HERE"
 
 (Find the gid in that tab's URL, after `#gid=`.) Leave these out and the
 Accounts/HR tabs will just show an info message instead of erroring.
+
+### Optional: Vendekin-Nestle Coffee
+
+The **Vendekin-Nestle Coffee** section reads a separate sheet of raw,
+per-transaction rows (`order_id`, `machine_id`, `machine_name`, `txn_ts`,
+`txn_date`, `product_name`, `price`, `qty`, `amount`, `dispense_status`,
+`dispense_ok`, `is_test`, ...) — a different shape from the pre-aggregated
+Vendekin Snacks tables above, since this line's data isn't rolled up before
+it reaches the sheet. If you use it, add:
+
+```toml
+[sheets]
+dashboard = "..."
+nestle_coffee = "PASTE_THE_COFFEE_SHEET_ID_HERE"
+
+[gids.nestle_coffee]
+transactions = "PASTE_THE_TRANSACTIONS_TAB_GID_HERE"
+```
+
+Rows where `is_test` is `TRUE` are dropped automatically. `city` is derived
+from `machine_name` (the token right after the numeric machine ID, e.g.
+`150176_Mohali_...` → `Mohali`). Leave this out and the Coffee section will
+just show an info message instead of erroring — the other sections keep
+working regardless.
 
 ---
 
@@ -185,6 +216,20 @@ manual redeploy step needed.
 
 ## What's in the dashboard
 
+Pick a **Section** from the sidebar dropdown to switch machine lines. Each
+section has its own filters (shown below the Section picker) and its own
+tabs — they don't share a sidebar filter set, since each line's data has a
+different shape.
+
+### Aggregate
+
+Combined KPIs (revenue, units, machine count) and a daily-revenue-by-brand
+chart across every connected line, plus a per-brand summary table. A line
+with no data source yet shows as "Not Connected" rather than being quietly
+left out of the totals.
+
+### Vendekin Snacks
+
 - **Pace-adjusted "Today":** if the latest date in the sheet is also today
   in India (the app always reckons "now" in IST, regardless of the
   server's own time zone), that day's row is a partial day, not a
@@ -193,8 +238,7 @@ manual redeploy step needed.
   comparison (Overview's snapshot, Needs Attention, the Today tab) to
   compare against the *same point in the day* rather than a full day —
   so a check at 11am IST isn't scored against yesterday's full 24 hours.
-- **Sidebar:** date range picker, city filter, machine filter, manual
-  refresh button
+- **Sidebar filters:** date range, city, machine
 - **KPI row:** total revenue, units sold, average daily revenue, machines
   in view, failure rate — all respect the filters above
 - **Overview tab:** D/D-1/D-2/average daily-revenue snapshot, daily revenue
@@ -230,6 +274,30 @@ manual redeploy step needed.
   sheet (see "Optional: Accounts / HR tabs" above)
 - **HR tab:** payroll detected from the Accounts ledger — per-employee
   totals, monthly payroll trend, full payment history
+
+### Vendekin-Nestle Coffee
+
+Built from raw per-transaction rows rather than pre-aggregated tables, so
+there's no refill or product-category data for this line yet.
+
+- **Sidebar filters:** date range, city, machine
+- **KPI row:** total revenue, units sold, average daily revenue, machines
+  in view, failure rate (`dispense_ok = FALSE`)
+- **Overview tab:** daily revenue trend, top machines by revenue
+- **Revenue & Products tab:** daily revenue, revenue by hour of day (real
+  hourly timestamps, unlike Snacks' month-level hourly pattern), top
+  products by revenue
+- **Failures tab:** failed-transaction count and amount lost, trend by
+  day, top machines by amount lost, full failure log
+- **Machines tab:** directory derived from the transaction log itself
+  (no separate machine master data for this line) with revenue, units,
+  and failure rate per machine
+
+### Wendor Snacks / Eazyvend Protein
+
+Placeholders for now — each shows an info message until a data source is
+connected. Once one is, it picks up the same kind of views as the other
+two lines and starts showing up in Aggregate.
 
 ---
 
