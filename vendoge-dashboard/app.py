@@ -24,6 +24,12 @@ ACCENT = "#F2A93B"       # warm amber — restock/alert accent
 PALETTE = [PRIMARY, ACCENT, "#6C8EBF", "#B85C5C", "#6B5CA5", "#4F8A3D",
            "#C98A3B", "#3B8A8C", "#A8556C", "#7A8C3B", "#555B6E"]
 
+IST = "Asia/Kolkata"  # the fleet operates in India; always reckon "now" in IST, not the server's own clock
+
+
+def _now_ist() -> pd.Timestamp:
+    return pd.Timestamp.now(tz=IST)
+
 st.set_page_config(
     page_title="Vendoge Dashboard",
     page_icon="🥤",
@@ -297,7 +303,7 @@ if st.sidebar.button("🔄 Refresh data now"):
     st.session_state.pop("sidebar_machines", None)
     st.rerun()
 
-st.sidebar.caption(f"Last pulled: {pd.Timestamp.now().strftime('%d %b %Y, %I:%M %p')}")
+st.sidebar.caption(f"Last pulled: {_now_ist().strftime('%d %b %Y, %I:%M %p')} IST")
 st.sidebar.caption("Data auto-refreshes every 5 minutes.")
 
 
@@ -349,8 +355,8 @@ def _hour_of_day_pattern(hourly_df: pd.DataFrame, as_of_month_start) -> pd.Serie
 
 
 def _elapsed_day_fraction(latest_date, hourly_df):
-    """(is_partial, fraction_of_a_typical_day_elapsed_by_now, now)."""
-    now = pd.Timestamp.now()
+    """(is_partial, fraction_of_a_typical_day_elapsed_by_now, now), reckoned in IST."""
+    now = _now_ist()
     if pd.isna(latest_date) or latest_date.date() != now.date():
         return False, 1.0, now
     totals = _hour_of_day_pattern(hourly_df, latest_date.replace(day=1))
@@ -2231,7 +2237,7 @@ with tab_hr:
                 k4.metric("Avg. Payment",   f"₹{_avg_payment:,.0f}")
 
                 if hr_date and not hr_df[hr_date].isna().all():
-                    _this_month = pd.Timestamp.now().to_period("M")
+                    _this_month = _now_ist().to_period("M")
                     _mtd = hr_df[hr_df[hr_date].dt.to_period("M") == _this_month]["_paid"].sum()
                     st.caption(f"Paid so far this month ({_this_month}): ₹{_mtd:,.0f}")
 

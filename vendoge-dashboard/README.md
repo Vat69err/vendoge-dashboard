@@ -186,12 +186,13 @@ manual redeploy step needed.
 ## What's in the dashboard
 
 - **Pace-adjusted "Today":** if the latest date in the sheet is also today
-  (by the server's clock), that day's row is a partial day, not a finished
-  one. The app detects this from the clock and the fleet's own hour-of-day
+  in India (the app always reckons "now" in IST, regardless of the
+  server's own time zone), that day's row is a partial day, not a
+  finished one. The app detects this and the fleet's own hour-of-day
   revenue pattern, shows a banner about it, and adjusts every Today
   comparison (Overview's snapshot, Needs Attention, the Today tab) to
   compare against the *same point in the day* rather than a full day —
-  so a check at 11am isn't scored against yesterday's full 24 hours.
+  so a check at 11am IST isn't scored against yesterday's full 24 hours.
 - **Sidebar:** date range picker, city filter, machine filter, manual
   refresh button
 - **KPI row:** total revenue, units sold, average daily revenue, machines
