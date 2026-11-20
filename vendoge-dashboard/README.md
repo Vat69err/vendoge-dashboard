@@ -175,6 +175,54 @@ coffee = "PASTE_THE_DUO_GUSTO_COSTS_TAB_GID_HERE"
 
 ---
 
+### Optional: Customer Complaints
+
+Adds a **Live Machine Status** tab to Vendekin-Nestle Coffee and a
+**Customer Complaints** tab to Vendekin Snacks, from your QR
+customer-complaint-form sheet:
+
+```toml
+[sheets]
+dashboard = "..."
+complaints = "PASTE_THE_CUSTOMER_COMPLAINTS_SHEET_ID_HERE"
+```
+
+That sheet is read by tab name (like `dashboard`), so no gids are
+needed — it expects tabs named `Complaints`, `Verdicts`, `Product
+complaints`, and `Location budget`, matching the sheet as given.
+
+- Complaints are logged with a free-text location
+  ("Mohali CGC Jhanjeri Einstein Hostel"), not a machine ID, so the app
+  matches them to each section's own machine list by normalizing both
+  sides (strip the leading numeric ID and trailing machine-code token,
+  lowercase, fold punctuation) — validated against the real sheet at
+  182/186 (98%) of real Vending complaints matched cleanly; the rest are
+  genuinely new/unlisted locations, surfaced in an "unrecognized
+  machine" list rather than guessed. Each complaint is also joined to
+  its own `Verdicts` row (GENUINE / CHECK / LIKELY FAKE) so a likely-fake
+  refund claim doesn't skew a machine's status or the refund-at-risk KPI.
+- The Customer Complaints sheet's Machine dropdown only covers Vendekin
+  Snacks and Vendekin-Nestle Coffee locations today — not Wendor — so
+  that's this feature's current scope too.
+- **Live Machine Status** (Coffee) combines that with the transaction
+  data to flag, per machine: a whole-machine quiet period vs. its own
+  baseline (today's hour-by-hour pattern vs. a trailing 30-day median,
+  the same mechanic the Timing Anomalies tab uses); an elevated
+  dispense-failure rate; and — grouping beverages that share a premix
+  ingredient, from the Margin & COGS cost sheet's "Premix Used" column —
+  a premix-specific quiet period isolated to just the beverages that use
+  it, while the rest of the machine looks normal (checked only when the
+  machine isn't already flagged quiet overall, since otherwise it's just
+  collateral noise from a different problem). This is a **triage aid,
+  not a diagnosis**: a whole-machine quiet period could mean an empty
+  water tank, no cups, or a QR/network outage, and these can look alike
+  in the data — read the matched complaint text in the same tab before
+  acting on a flag.
+- Leave this out and the Live Machine Status / Customer Complaints tabs
+  show a message instead of erroring; everything else is unaffected.
+
+---
+
 ## 2. Run it locally first (recommended before deploying)
 
 Open a terminal in this folder and run:
@@ -358,6 +406,11 @@ machine isn't understated.
   by the sidebar filters) per-product revenue, matched unit cost, COGS
   and gross margin, plus cost-data coverage % and a list of unpriced
   products — see "Optional: Margin & COGS" above
+- **Customer Complaints tab:** respects the sidebar filters. Open
+  complaints, genuine-vs-likely-fake split, refund amount at risk,
+  filterable complaint log, the sheet's own repeat-complaint-by-product
+  rollup, weekly refund-rate-vs-budget by location, and an unrecognized-
+  machine list — see "Optional: Customer Complaints" above
 - **Accounts tab:** bank ledger KPIs, P&L snapshot and waterfall, cash
   flow analytics, full transaction log — reads the separate accounts
   sheet (see "Optional: Accounts / HR tabs" above)
@@ -374,6 +427,16 @@ there's no refill or product-category data for this line yet.
   in view, failure rate (`dispense_ok = FALSE`)
 - **Overview tab:** daily revenue trend, top machines by revenue, and the
   Machine-wise Revenue Snapshot (see above)
+- **Live Machine Status tab:** per-machine triage combining a whole-machine
+  quiet-vs-baseline check, a dispense-failure-rate spike check, a
+  premix-specific quiet check (beverages sharing a premix ingredient
+  going quiet together while the rest of the machine looks normal), and
+  recent matched customer complaints (fraud-filtered via the complaint
+  sheet's own Verdict) — see "Optional: Customer Complaints" above. Pick
+  Today / D-1 / D-2; flags as 🟢 Normal / 🟡 Watch / 🔴 Likely Issue with
+  the specific reasons spelled out, plus a per-machine complaint
+  drill-down and an unrecognized-machine list. Explicitly a triage aid,
+  not a diagnosis.
 - **Revenue & Products tab:** daily revenue, revenue by hour of day (real
   hourly timestamps, unlike Snacks' month-level hourly pattern), top
   products by revenue, and a machine-wise breakdown of each machine's

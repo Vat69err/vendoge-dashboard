@@ -537,12 +537,13 @@ def load_coffee_cost_lookup() -> pd.DataFrame:
         return pd.DataFrame(columns=["beverage", "norm", "unit_cost"])
     start = header_rows[0] + 1
 
-    cost_col = 2  # observed layout: Beverage, Premix Used, Fully-Loaded Cost/Cup, ...
-    header_vals = raw.loc[header_rows[0]].astype(str).str.lower()
+    cost_col, premix_col = 2, 1  # observed layout: Beverage, Premix Used, Fully-Loaded Cost/Cup, ...
+    header_vals = raw.loc[header_rows[0]].fillna("").astype(str).str.lower()
     for idx, val in header_vals.items():
         if "fully-loaded" in val and "cost" in val:
             cost_col = idx
-            break
+        elif "premix" in val:
+            premix_col = idx
 
     rows = []
     for i in range(start, len(raw)):
@@ -552,7 +553,8 @@ def load_coffee_cost_lookup() -> pd.DataFrame:
         cost = pd.to_numeric(re.sub(r"[^\d.]", "", str(raw.iat[i, cost_col])), errors="coerce")
         if pd.isna(cost):
             break
-        rows.append({"beverage": name, "unit_cost": float(cost)})
+        premix = str(raw.iat[i, premix_col]).strip()
+        rows.append({"beverage": name, "unit_cost": float(cost), "premix": premix if premix.lower() != "nan" else ""})
 
     out = pd.DataFrame(rows)
     if not out.empty:
@@ -587,6 +589,179 @@ def match_coffee_cost(product_names: list, cost_df: pd.DataFrame) -> dict:
         n = COFFEE_SOLD_NAME_ALIAS.get(n, n)
         out[name] = cost_map.get(n)
     return out
+
+
+# ============================================================
+# 2e. CUSTOMER COMPLAINTS — QR-code complaint form log (Snacks + Coffee machines)
+# ============================================================
+COMPLAINTS_SHEET_ID = st.secrets.get("sheets", {}).get("complaints")
+
+COMPLAINTS_SHEET_NAMES = {
+    "complaints": "Complaints",
+    "verdicts": "Verdicts",
+    "product_complaints": "Product complaints",
+    "location_budget": "Location budget",
+}
+
+
+def _complaints_csv_url(sheet_name: str) -> str:
+    return (
+        f"https://docs.google.com/spreadsheets/d/{COMPLAINTS_SHEET_ID}/gviz/tq"
+        f"?tqx=out:csv&sheet={quote(sheet_name)}"
+    )
+
+
+def _read_complaints_sheet(sheet_name: str) -> pd.DataFrame:
+    try:
+        return pd.read_csv(_complaints_csv_url(sheet_name))
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner="Pulling latest customer complaints...")
+def load_complaints() -> dict:
+    complaints = _read_complaints_sheet(COMPLAINTS_SHEET_NAMES["complaints"])
+    verdicts = _read_complaints_sheet(COMPLAINTS_SHEET_NAMES["verdicts"])
+    product_complaints = _read_complaints_sheet(COMPLAINTS_SHEET_NAMES["product_complaints"])
+    location_budget = _read_complaints_sheet(COMPLAINTS_SHEET_NAMES["location_budget"])
+
+    if not complaints.empty:
+        complaints["Submitted At"] = pd.to_datetime(complaints.get("Submitted At"), errors="coerce")
+        complaints["Issue Date"] = pd.to_datetime(complaints.get("Issue Date"), errors="coerce")
+        complaints["Amount (Rs)"] = pd.to_numeric(complaints.get("Amount (Rs)"), errors="coerce")
+        # Join each complaint's anti-fraud verdict (Verdicts.Ticket == Complaints."Complaint ID").
+        if not verdicts.empty and {"Ticket", "Verdict"}.issubset(verdicts.columns) and "Complaint ID" in complaints.columns:
+            v = verdicts[["Ticket", "Score", "Verdict", "Why"]].rename(columns={"Ticket": "Complaint ID"})
+            complaints = complaints.merge(v, on="Complaint ID", how="left")
+        if "Verdict" not in complaints.columns:
+            complaints["Verdict"] = pd.NA
+
+    return {
+        "complaints": complaints,
+        "product_complaints": product_complaints,
+        "location_budget": location_budget,
+    }
+
+
+if COMPLAINTS_SHEET_ID:
+    try:
+        complaints_data = load_complaints()
+        COMPLAINTS_LOAD_ERROR = None if not complaints_data["complaints"].empty else (
+            "The Customer Complaints sheet loaded but the `Complaints` tab has no rows."
+        )
+    except Exception as e:
+        complaints_data = {"complaints": pd.DataFrame(), "product_complaints": pd.DataFrame(), "location_budget": pd.DataFrame()}
+        COMPLAINTS_LOAD_ERROR = f"Couldn't load the Customer Complaints sheet.\n\nTechnical detail: {e}"
+else:
+    complaints_data = {"complaints": pd.DataFrame(), "product_complaints": pd.DataFrame(), "location_budget": pd.DataFrame()}
+    COMPLAINTS_LOAD_ERROR = (
+        "Missing secrets! This needs `[sheets] complaints` (the sheet ID) set up in Streamlit secrets."
+    )
+
+COMPLAINTS_DATA_OK = COMPLAINTS_LOAD_ERROR is None and not complaints_data["complaints"].empty
+
+# Complaints are logged with a free-text location ("Mohali CGC Jhanjeri Einstein
+# Hostel"), not a machine ID, so we match it against each section's own machine_name
+# ("333001_Mohali_CGC_Jhanjeri_Einstein_Hostel_C10") by normalizing both: strip the
+# leading numeric ID and trailing machine-code token, lowercase, fold punctuation to
+# spaces. Validated against the real sheet: 182/186 real Vending complaints matched
+# cleanly this way: the rest are genuinely new/unlisted locations, correctly left
+# unmatched rather than guessed.
+_MACHINE_CODE_SUFFIX_RE = re.compile(r"^[A-Za-z]{1,2}\d+[A-Za-z]?$")
+_LEADING_ID_RE = re.compile(r"^\s*\d{4,}\s*[-‐-―]\s*")
+
+
+def _norm_location_text(s) -> str:
+    s = str(s).lower()
+    s = re.sub(r"\(.*?\)", " ", s)  # drop parenthetical suffixes like "(Vending)"
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _norm_machine_name(machine_name) -> str:
+    parts = str(machine_name).split("_")
+    if parts and parts[0].isdigit():
+        parts = parts[1:]
+    if parts and _MACHINE_CODE_SUFFIX_RE.match(parts[-1]):
+        parts = parts[:-1]
+    return _norm_location_text(" ".join(parts))
+
+
+def match_complaints_to_machines(complaints_df: pd.DataFrame, machines_lookup: pd.DataFrame) -> pd.DataFrame:
+    """
+    `machines_lookup` needs machine_id/machine_name columns for one section's fleet.
+    Adds matched_machine_id/matched_machine_name (NaN when nothing matches with
+    confidence -- never guessed). Tries, in order: a literal machine ID typed into
+    "Other Machine"; the normalized "Machine" text; and, only when "Machine" is the
+    dropdown's "Not in this list" option, the normalized "Other Machine" free text.
+    """
+    out = complaints_df.copy()
+    if machines_lookup.empty or out.empty:
+        out["matched_machine_id"] = pd.NA
+        out["matched_machine_name"] = pd.NA
+        return out
+
+    id_set = set(machines_lookup["machine_id"].astype(str))
+    id_to_name = dict(zip(machines_lookup["machine_id"].astype(str), machines_lookup["machine_name"]))
+    norm_to_id = {}
+    for mid, mname in zip(machines_lookup["machine_id"].astype(str), machines_lookup["machine_name"]):
+        norm_to_id.setdefault(_norm_machine_name(mname), mid)
+
+    def _resolve(raw_machine, other_machine):
+        other = str(other_machine).strip() if pd.notna(other_machine) else ""
+        if other.isdigit() and other in id_set:
+            return other
+        candidate = other if str(raw_machine).strip().lower().startswith("not in this list") else str(raw_machine)
+        candidate = _LEADING_ID_RE.sub("", candidate)
+        return norm_to_id.get(_norm_location_text(candidate))
+
+    machine_col = out["Machine"] if "Machine" in out.columns else pd.Series([""] * len(out), index=out.index)
+    other_col = out["Other Machine"] if "Other Machine" in out.columns else pd.Series([None] * len(out), index=out.index)
+    out["matched_machine_id"] = [_resolve(r, o) for r, o in zip(machine_col, other_col)]
+    out["matched_machine_name"] = out["matched_machine_id"].map(id_to_name)
+    return out
+
+
+# ============================================================
+# SHARED: per-hour actual-vs-baseline helpers (machine quiet / failure-spike checks)
+# ============================================================
+def _baseline_hourly_median(scope_df: pd.DataFrame, baseline_start, baseline_end, max_hour: int,
+                             date_col: str = "txn_date", hour_col: str = "hour") -> pd.Series:
+    """Median transaction count per hour-of-day (0..max_hour) across a trailing baseline
+    window -- the same mechanic the Timing Anomalies tabs use, factored out for reuse."""
+    baseline = scope_df[(scope_df[date_col] >= baseline_start) & (scope_df[date_col] <= baseline_end)]
+    bdates = pd.date_range(baseline_start, baseline_end, freq="D")
+    grid = pd.MultiIndex.from_product([bdates, range(max_hour + 1)], names=["date", "hour"]).to_frame(index=False)
+    actual_hist = baseline.groupby([baseline[date_col], baseline[hour_col]]).size().reset_index()
+    actual_hist.columns = ["date", "hour", "count"]
+    grid = grid.merge(actual_hist, on=["date", "hour"], how="left")
+    grid["count"] = grid["count"].fillna(0)
+    return grid.groupby("hour")["count"].median().reindex(range(max_hour + 1), fill_value=0)
+
+
+def _is_quiet_machine(scope_df: pd.DataFrame, day, baseline_start, baseline_end, max_hour: int,
+                       date_col: str = "txn_date", hour_col: str = "hour") -> bool:
+    """True when most of today's elapsed, normally-active hours came back unusually
+    low -- checked hour-by-hour since whole-machine volume is usually dense enough for that."""
+    baseline_med = _baseline_hourly_median(scope_df, baseline_start, baseline_end, max_hour, date_col, hour_col)
+    day_df = scope_df[scope_df[date_col] == day]
+    day_counts = day_df.groupby(hour_col).size().reindex(range(max_hour + 1), fill_value=0)
+    active = baseline_med >= 2
+    if active.sum() < 2:
+        return False
+    flagged = active & (day_counts <= baseline_med * 0.3)
+    return bool((flagged.sum() / active.sum()) >= 0.5)
+
+
+def _is_quiet_subset(scope_df: pd.DataFrame, day, baseline_start, baseline_end, max_hour: int,
+                      date_col: str = "txn_date", hour_col: str = "hour") -> bool:
+    """True when a lower-volume slice's (e.g. one shared premix's beverages) total for
+    the day, so far, is well under its own baseline total -- a daily-total comparison is
+    more robust than per-hour when the hourly counts are too sparse to read individually."""
+    baseline_med = _baseline_hourly_median(scope_df, baseline_start, baseline_end, max_hour, date_col, hour_col)
+    expected = baseline_med.sum()
+    actual = scope_df[(scope_df[date_col] == day) & (scope_df[hour_col] <= max_hour)].shape[0]
+    return bool(expected >= 2 and actual <= expected * 0.3)
 
 
 # ============================================================
@@ -958,10 +1133,10 @@ def render_vendekin_snacks():
     # 6. TABS
     # ============================================================
     (tab_overview, tab_attention, tab_today, tab_revenue, tab_refill, tab_failures, tab_sku,
-     tab_machines, tab_outliers, tab_margin, tab_accounts, tab_hr) = st.tabs([
+     tab_machines, tab_outliers, tab_margin, tab_complaints, tab_accounts, tab_hr) = st.tabs([
         "📊 Overview", "🚨 Needs Attention", "📅 Today", "💰 Revenue & Sales", "🔁 Refilling",
         "🚫 Failures", "🧃 SKU Mix", "🖥️ Machines", "⚠️ Outliers", "📈 Margin & COGS",
-        "💳 Accounts", "👥 HR",
+        "📣 Customer Complaints", "💳 Accounts", "👥 HR",
     ])
 
     # ---------- OVERVIEW ----------
@@ -1938,6 +2113,103 @@ def render_vendekin_snacks():
                 MARGIN_SNACKS_WENDOR_DATA_OK, MARGIN_SNACKS_WENDOR_LOAD_ERROR,
                 "Distributors × SKU × Margin",
             )
+
+    with tab_complaints:
+        st.subheader("📣 Customer Complaints")
+        st.caption(
+            "From the QR customer-complaint form, matched to machines by location text and "
+            "joined to its own anti-fraud verdict (GENUINE / CHECK / LIKELY FAKE). Respects the "
+            "sidebar's date range, city, and machine filters."
+        )
+
+        if not COMPLAINTS_DATA_OK:
+            st.warning(f"Customer complaints aren't loaded ({COMPLAINTS_LOAD_ERROR}).")
+        else:
+            snacks_complaints_all = complaints_data["complaints"]
+            snacks_complaints_all = snacks_complaints_all[snacks_complaints_all.get("Machine Type") == "Vending Machine"]
+            snacks_machines_lookup = machines_df[["machine_id", "machine_name"]].drop_duplicates()
+            sc = match_complaints_to_machines(snacks_complaints_all, snacks_machines_lookup)
+            _machine_city = machines_df[["machine_id", "city"]].drop_duplicates()
+            _machine_city["matched_machine_id"] = _machine_city["machine_id"].astype(str)
+            sc = sc.merge(_machine_city[["matched_machine_id", "city"]], on="matched_machine_id", how="left")
+
+            sc_date_mask = (sc["Submitted At"].dt.date >= start_date) & (sc["Submitted At"].dt.date <= end_date)
+            sc_dated = sc[sc_date_mask]
+            sc = sc_dated[sc_dated["matched_machine_id"].notna()]
+            if city_sel:
+                sc = sc[sc["city"].isin(city_sel)]
+            if machine_sel:
+                sc = sc[sc["matched_machine_name"].isin(machine_sel)]
+
+            genuine = sc[sc["Verdict"].isin(["GENUINE", "CHECK"])]
+            fake = sc[sc["Verdict"] == "LIKELY FAKE"]
+            refund_at_risk = genuine["Amount (Rs)"].fillna(0).sum()
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Open Complaints", int((sc["Status"] == "Open").sum()) if "Status" in sc.columns else len(sc))
+            k2.metric("Genuine / Check", len(genuine))
+            k3.metric("Likely Fake", len(fake))
+            k4.metric("Refund at Risk (genuine+check)", f"₹{refund_at_risk:,.0f}")
+
+            st.divider()
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                verdict_filter = st.multiselect(
+                    "Filter by verdict", ["GENUINE", "CHECK", "LIKELY FAKE"],
+                    default=["GENUINE", "CHECK", "LIKELY FAKE"], key="complaints_verdict_filter",
+                )
+            with cc2:
+                problem_filter = st.multiselect(
+                    "Filter by problem type", sorted(sc["Problem"].dropna().unique().tolist()),
+                    key="complaints_problem_filter",
+                )
+            table = sc[sc["Verdict"].isin(verdict_filter)] if verdict_filter else sc
+            if problem_filter:
+                table = table[table["Problem"].isin(problem_filter)]
+
+            st.dataframe(
+                table.sort_values("Submitted At", ascending=False)[[
+                    "Submitted At", "matched_machine_name", "Problem", "Product", "Amount (Rs)",
+                    "Verdict", "Status", "Description",
+                ]].rename(columns={"Submitted At": "Submitted", "matched_machine_name": "Machine"}),
+                use_container_width=True, hide_index=True,
+            )
+
+            unmatched = sc_dated[sc_dated["matched_machine_id"].isna()]
+            if not unmatched.empty:
+                with st.expander(f"⚠️ {len(unmatched)} complaint(s) with an unrecognized machine"):
+                    st.dataframe(
+                        unmatched[["Submitted At", "Machine", "Other Machine", "Problem"]],
+                        use_container_width=True, hide_index=True,
+                    )
+
+            st.divider()
+            st.subheader("Repeat-complaint pattern by product & location")
+            st.caption(
+                "From the sheet's own `Product complaints` rollup — already separates \"many "
+                "different people complaining\" (a real product/machine problem) from \"one "
+                "person complaining repeatedly\" (a refund-abuse pattern)."
+            )
+            product_complaints = complaints_data["product_complaints"]
+            if product_complaints.empty:
+                st.info("No `Product complaints` data loaded.")
+            else:
+                st.dataframe(
+                    product_complaints.sort_values("Complaints", ascending=False),
+                    use_container_width=True, hide_index=True,
+                )
+
+            st.divider()
+            st.subheader("Weekly refund rate vs. budget, by location")
+            st.caption("From the sheet's own `Location budget` tab (already computed).")
+            location_budget = complaints_data["location_budget"]
+            if location_budget.empty:
+                st.info("No `Location budget` data loaded.")
+            else:
+                st.dataframe(
+                    location_budget.sort_values(["Week", "Refund rate"], ascending=[False, False]),
+                    use_container_width=True, hide_index=True,
+                )
 
     with tab_accounts:
         st.subheader("💳 Accounts Ledger")
@@ -2958,10 +3230,11 @@ def render_nestle_coffee():
 
     st.divider()
 
-    tab_cf_overview, tab_cf_revenue, tab_cf_failures, tab_cf_machines, tab_cf_timing, tab_cf_margin = st.tabs(
-        ["📊 Overview", "💰 Revenue & Products", "🚫 Failures", "🖥️ Machines", "⏱️ Timing Anomalies",
-         "📈 Margin & COGS"]
-    )
+    (tab_cf_overview, tab_cf_status, tab_cf_revenue, tab_cf_failures, tab_cf_machines, tab_cf_timing,
+     tab_cf_margin) = st.tabs([
+        "📊 Overview", "🔧 Live Machine Status", "💰 Revenue & Products", "🚫 Failures", "🖥️ Machines",
+        "⏱️ Timing Anomalies", "📈 Margin & COGS",
+    ])
 
     with tab_cf_overview:
         daily = success.groupby(success["txn_date"].dt.date)["amount"].sum().reset_index()
@@ -3012,6 +3285,180 @@ def render_nestle_coffee():
                 _cf_snap_disp.rename(columns={"machine_name": "Machine", "city": "City"}),
                 use_container_width=True, hide_index=True,
             )
+
+    with tab_cf_status:
+        st.subheader("🔧 Live Machine Status")
+        st.caption(
+            "A **triage aid, not a diagnosis**: combines today's transaction pattern against each "
+            "machine's own baseline with recent customer complaints. Several real causes can look "
+            "alike in this data — an empty water tank vs. a QR/network outage, a jammed dispenser "
+            "vs. an empty premix — so treat the flags below as where to look first, not a confirmed "
+            "fault, and read the complaint detail for yourself before acting."
+        )
+
+        status_day_choice = st.radio("Day", ["Today", "D-1", "D-2"], horizontal=True, key="cf_status_day")
+        status_offset = {"Today": 0, "D-1": 1, "D-2": 2}[status_day_choice]
+        status_latest = cf_full["txn_date"].max()
+
+        if pd.isna(status_latest):
+            st.info("No data available for the current City/Machine filters.")
+        else:
+            status_day = status_latest - pd.Timedelta(days=status_offset)
+            status_baseline_end = status_latest - pd.Timedelta(days=3)
+            status_baseline_start = status_baseline_end - pd.Timedelta(days=29)
+            status_is_today = status_day.date() == _now_ist().date()
+            status_max_hour = _now_ist().hour if status_is_today else 23
+
+            cf_full_h = cf_full.copy()
+            cf_full_h["hour"] = cf_full_h["txn_ts"].dt.hour
+            cf_success_h = cf_full_h[cf_full_h["dispense_ok"] == True]  # noqa: E712
+            cf_failed_h = cf_full_h[cf_full_h["dispense_ok"] == False]  # noqa: E712
+
+            # Group beverages that share a premix ingredient (from the Margin & COGS cost
+            # sheet) -- a premix-specific drop stands out when it's isolated to exactly
+            # the beverages that use it, while the rest of the machine looks normal.
+            premix_groups = {}
+            if MARGIN_COFFEE_DATA_OK and "premix" in coffee_cost_df.columns:
+                for _, _r in coffee_cost_df.iterrows():
+                    for _token in str(_r["premix"]).split("+"):
+                        _token = _token.strip().lower()
+                        if not _token or "water only" in _token or _token in ("-", "nan"):
+                            continue
+                        premix_groups.setdefault(_token, []).append(_r["beverage"])
+                premix_groups = {k: v for k, v in premix_groups.items() if len(v) >= 2}
+
+            # Match recent Coffee Machine complaints to this fleet's machines.
+            cf_complaints = pd.DataFrame()
+            if COMPLAINTS_DATA_OK:
+                raw_complaints = complaints_data["complaints"]
+                coffee_complaints = raw_complaints[raw_complaints.get("Machine Type") == "Coffee Machine"]
+                coffee_machines_lookup = cf_full[["machine_id", "machine_name"]].drop_duplicates()
+                cf_complaints = match_complaints_to_machines(coffee_complaints, coffee_machines_lookup)
+                cf_complaints = cf_complaints[
+                    cf_complaints["Submitted At"] >= (status_latest - pd.Timedelta(days=7))
+                ]
+
+            status_rows = []
+            detail_by_machine = {}
+            for mid in sorted(cf_full["machine_id"].dropna().unique()):
+                m_name = cf_full.loc[cf_full["machine_id"] == mid, "machine_name"].iloc[0]
+                m_all = cf_full_h[cf_full_h["machine_id"] == mid]
+                m_success = cf_success_h[cf_success_h["machine_id"] == mid]
+                m_failed = cf_failed_h[cf_failed_h["machine_id"] == mid]
+
+                quiet = _is_quiet_machine(m_all, status_day, status_baseline_start, status_baseline_end, status_max_hour)
+
+                day_total = m_all[m_all["txn_date"] == status_day].shape[0]
+                day_failed = m_failed[m_failed["txn_date"] == status_day].shape[0]
+                day_rate = (day_failed / day_total) if day_total else None
+                hist_total = m_all[(m_all["txn_date"] >= status_baseline_start) & (m_all["txn_date"] <= status_baseline_end)].shape[0]
+                hist_failed = m_failed[(m_failed["txn_date"] >= status_baseline_start) & (m_failed["txn_date"] <= status_baseline_end)].shape[0]
+                hist_rate = (hist_failed / hist_total) if hist_total else None
+                failure_spike = bool(
+                    day_total >= 5 and hist_total >= 10 and day_rate is not None and hist_rate is not None
+                    and day_rate >= max(hist_rate * 2, hist_rate + 0.15)
+                )
+
+                # A premix-specific flag is only meaningful when the rest of the machine
+                # is still selling normally -- otherwise it's just collateral noise from
+                # a whole-machine problem already captured by `quiet`.
+                premix_flags = []
+                if not quiet:
+                    for _premix, _beverages in premix_groups.items():
+                        _scope = m_success[m_success["product_name"].isin(_beverages)]
+                        if _is_quiet_subset(_scope, status_day, status_baseline_start, status_baseline_end, status_max_hour):
+                            premix_flags.append((_premix, _beverages))
+
+                m_complaints = cf_complaints[cf_complaints["matched_machine_id"] == str(mid)] if not cf_complaints.empty else cf_complaints
+                genuine = m_complaints[m_complaints["Verdict"].isin(["GENUINE", "CHECK"])] if not m_complaints.empty else m_complaints
+                fake = m_complaints[m_complaints["Verdict"] == "LIKELY FAKE"] if not m_complaints.empty else m_complaints
+
+                causes = []
+                if quiet and not failure_spike:
+                    causes.append("Quiet vs. usual, no unusual failure spike — possible QR/network issue or just low footfall")
+                if failure_spike:
+                    causes.append(
+                        f"Dispense failures elevated ({day_rate * 100:.0f}% vs. usual {hist_rate * 100:.0f}%) "
+                        "— possible water/cup/powder-out or a jam"
+                    )
+                for _premix, _beverages in premix_flags:
+                    causes.append(f"{' & '.join(_beverages)} quiet together (share {_premix.title()}) — possible premix running out")
+                if not genuine.empty:
+                    _text = (genuine["Description"].fillna("") + " " + genuine["Problem"].fillna("")).str.lower()
+                    _tags = []
+                    if _text.str.contains("water").any():
+                        _tags.append("water-instead-of-coffee pattern")
+                    if _text.str.contains("jam|stuck", regex=True).any():
+                        _tags.append("possible jam")
+                    if _text.str.contains("qr|scan|network", regex=True).any():
+                        _tags.append("QR/network hint")
+                    _tag_str = f" ({', '.join(_tags)})" if _tags else ""
+                    causes.append(f"{len(genuine)} genuine/check complaint(s) in last 7 days{_tag_str}")
+
+                strong_txn_signal = failure_spike or bool(premix_flags)
+                if strong_txn_signal or (quiet and not genuine.empty) or len(genuine) >= 2:
+                    status = "🔴 Likely Issue"
+                elif quiet or not genuine.empty:
+                    status = "🟡 Watch"
+                else:
+                    status = "🟢 Normal"
+
+                status_rows.append({
+                    "Status": status, "Machine": m_name,
+                    "Causes": "; ".join(causes) if causes else "—",
+                    f"Transactions ({status_day_choice})": day_total,
+                    "Recent Complaints (7d)": len(m_complaints) if not m_complaints.empty else 0,
+                    "Genuine/Check": len(genuine) if not genuine.empty else 0,
+                    "Likely Fake": len(fake) if not fake.empty else 0,
+                })
+                detail_by_machine[m_name] = m_complaints
+
+            status_df = pd.DataFrame(status_rows)
+            _status_order = {"🔴 Likely Issue": 0, "🟡 Watch": 1, "🟢 Normal": 2}
+            status_df["_sort"] = status_df["Status"].map(_status_order)
+            status_df = status_df.sort_values(["_sort", "Recent Complaints (7d)"], ascending=[True, False]).drop(columns="_sort")
+
+            n_issue = (status_df["Status"] == "🔴 Likely Issue").sum()
+            n_watch = (status_df["Status"] == "🟡 Watch").sum()
+            n_normal = (status_df["Status"] == "🟢 Normal").sum()
+            k1, k2, k3 = st.columns(3)
+            k1.metric("🔴 Likely Issue", n_issue)
+            k2.metric("🟡 Watch", n_watch)
+            k3.metric("🟢 Normal", n_normal)
+            if not COMPLAINTS_DATA_OK:
+                st.caption(f"ℹ️ Customer complaints aren't loaded ({COMPLAINTS_LOAD_ERROR}) — status below is transaction-only.")
+
+            st.dataframe(status_df, use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.subheader("Complaint detail")
+            _machines_with_complaints = [m for m, d in detail_by_machine.items() if not d.empty]
+            if not _machines_with_complaints:
+                st.info("No matched Coffee Machine complaints in the last 7 days for the current filters.")
+            else:
+                _detail_machine = st.selectbox("Machine", _machines_with_complaints, key="cf_status_detail_machine")
+                _detail = detail_by_machine[_detail_machine].sort_values("Submitted At", ascending=False)
+                st.dataframe(
+                    _detail[["Submitted At", "Problem", "Product", "Description", "Verdict", "Status"]].rename(
+                        columns={"Submitted At": "Submitted"}
+                    ),
+                    use_container_width=True, hide_index=True,
+                )
+
+            if COMPLAINTS_DATA_OK:
+                _unmatched_cf = complaints_data["complaints"][
+                    (complaints_data["complaints"].get("Machine Type") == "Coffee Machine")
+                ]
+                _unmatched_cf = match_complaints_to_machines(
+                    _unmatched_cf, cf_full[["machine_id", "machine_name"]].drop_duplicates()
+                )
+                _unmatched_cf = _unmatched_cf[_unmatched_cf["matched_machine_id"].isna()]
+                if not _unmatched_cf.empty:
+                    with st.expander(f"⚠️ {len(_unmatched_cf)} complaint(s) with an unrecognized machine"):
+                        st.dataframe(
+                            _unmatched_cf[["Submitted At", "Machine", "Other Machine", "Problem"]],
+                            use_container_width=True, hide_index=True,
+                        )
 
     with tab_cf_revenue:
         rv_c1, rv_c2 = st.columns(2)
