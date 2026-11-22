@@ -2256,16 +2256,100 @@ def render_vendekin_snacks():
                 )
 
     with tab_inventory:
-        st.subheader("📦 Inventory — Warehouse Stock-In")
-        st.caption(
-            "From the manual stock-in log. Respects the sidebar's date range; not filtered "
-            "by City/Machine since stock-in is recorded per warehouse, which can feed several "
-            "machines across more than one city."
-        )
+        st.subheader("📦 Inventory")
 
         if not INVENTORY_DATA_OK:
             st.warning(f"Inventory data isn't loaded ({INVENTORY_LOAD_ERROR}).")
         else:
+            # ============================================================
+            # CURRENT INVENTORY — a cumulative-balance estimate, so it always
+            # uses the FULL stock-in history, never the sidebar's date range
+            # (a running balance isn't a period metric).
+            # ============================================================
+            st.markdown("### 📊 Current Inventory — Warehouse-wise (Estimated)")
+
+            tracking_since = stock_in_df["Date"].min()
+            tracking_asof = stock_in_df["Date"].max()
+
+            inv = stock_in_df.groupby(["Warehouse", "Product Name"], as_index=False)["Stock Qty (packets)"].sum()
+            inv = inv.rename(columns={"Stock Qty (packets)": "Cumulative Stock In"})
+
+            refill_product_df = data["refill_product"]
+            _required_rp_cols = {"warehouse", "product_name", "refill_qty"}
+            refill_usable = not refill_product_df.empty and _required_rp_cols.issubset(refill_product_df.columns)
+
+            if refill_usable:
+                rp_agg = refill_product_df.groupby(["warehouse", "product_name"], as_index=False)["refill_qty"].sum()
+                rp_agg["_norm_prod"] = rp_agg["product_name"].apply(_sku_basic_norm)
+                inv["_norm_prod"] = inv["Product Name"].apply(_sku_basic_norm)
+                inv = inv.merge(
+                    rp_agg[["warehouse", "_norm_prod", "refill_qty"]].rename(columns={"warehouse": "Warehouse"}),
+                    on=["Warehouse", "_norm_prod"], how="left",
+                ).drop(columns="_norm_prod")
+                inv["refill_qty"] = inv["refill_qty"].fillna(0)
+                inv = inv.rename(columns={"refill_qty": "Cumulative Refilled Out"})
+                inv["Current Inventory (est.)"] = inv["Cumulative Stock In"] - inv["Cumulative Refilled Out"]
+                st.info(
+                    f"📌 **How this is calculated:** cumulative packets stocked in, minus cumulative packets "
+                    f"refilled out to machines (matched by warehouse + product name), tracked since "
+                    f"**{tracking_since.date()}** (as of **{tracking_asof.date()}**).\n\n"
+                    "**Caveats:** doesn't include any stock a warehouse already held *before* "
+                    f"{tracking_since.date()}; only subtracts refills matched by product name, so a naming "
+                    "mismatch between the stock-in log and the refill log would overstate that product's "
+                    "inventory; and doesn't account for damage, loss, or stock moved by anything other than a "
+                    "logged refill. Treat this as an informed estimate, not a verified physical count — "
+                    "negative values below are a sign of one of these gaps, not a real negative stock."
+                )
+            else:
+                inv["Cumulative Refilled Out"] = pd.NA
+                inv["Current Inventory (est.)"] = inv["Cumulative Stock In"]
+                st.warning(
+                    "⚠️ **No usable product-level refill/consumption data yet** (the `Refill_Product` tab is "
+                    "empty or not in the expected shape), so the figures below are **cumulative stock-in "
+                    f"only** — tracked since **{tracking_since.date()}**, as of **{tracking_asof.date()}** — "
+                    "and do **not** subtract anything already refilled into machines. Treat this as an upper "
+                    "bound on current stock, not an actual balance, until refill data is wired up."
+                )
+
+            inv_by_wh = inv.groupby("Warehouse", as_index=False)["Current Inventory (est.)"].sum().sort_values(
+                "Current Inventory (est.)", ascending=False
+            )
+            fig_inv = px.bar(
+                inv_by_wh.sort_values("Current Inventory (est.)"), x="Current Inventory (est.)", y="Warehouse",
+                orientation="h", title="Estimated Current Inventory by Warehouse (packets)",
+                color_discrete_sequence=[ACCENT],
+            )
+            fig_inv.update_layout(xaxis_title="Packets", yaxis_title="")
+            st.plotly_chart(fig_inv, use_container_width=True)
+
+            inv_wh_choice = st.selectbox("Warehouse", inv_by_wh["Warehouse"].tolist(), key="inventory_current_warehouse")
+            inv_detail = inv[inv["Warehouse"] == inv_wh_choice].sort_values("Current Inventory (est.)", ascending=False)
+
+            if refill_usable:
+                negative_rows = inv_detail[inv_detail["Current Inventory (est.)"] < 0]
+                if not negative_rows.empty:
+                    st.caption(
+                        f"⚠️ {len(negative_rows)} product(s) here show more refilled out than ever stocked "
+                        "in — likely a product-name mismatch between the two sheets, or stock-in that "
+                        "predates this tracking log. Shown as-is below, not hidden."
+                    )
+                _inv_cols = ["Product Name", "Cumulative Stock In", "Cumulative Refilled Out", "Current Inventory (est.)"]
+            else:
+                _inv_cols = ["Product Name", "Cumulative Stock In", "Current Inventory (est.)"]
+            st.dataframe(inv_detail[_inv_cols], use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # ============================================================
+            # STOCK-IN DETAIL — the delivery log itself, respects the sidebar's date range.
+            # ============================================================
+            st.markdown("### 📥 Stock-In Detail")
+            st.caption(
+                "From the manual stock-in log. Respects the sidebar's date range; not filtered "
+                "by City/Machine since stock-in is recorded per warehouse, which can feed several "
+                "machines across more than one city."
+            )
+
             si = stock_in_df[
                 (stock_in_df["Date"].dt.date >= start_date) & (stock_in_df["Date"].dt.date <= end_date)
             ]
