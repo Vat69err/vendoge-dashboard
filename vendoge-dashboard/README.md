@@ -223,6 +223,54 @@ complaints`, and `Location budget`, matching the sheet as given.
 
 ---
 
+### Optional: Inventory
+
+Adds an **Inventory** tab to Vendekin Snacks, from your manual
+stock-in log:
+
+```toml
+[sheets]
+dashboard = "..."
+inventory = "PASTE_THE_INVENTORY_SHEET_ID_HERE"
+
+[gids.inventory]
+stock_in = "PASTE_THE_STOCK_IN_TAB_GID_HERE"
+```
+
+- One row per delivery line (date, warehouse, product, packet
+  quantity, invoice, distributor, the machines that warehouse feeds).
+  The sheet's own `Warehouse` column already matches the `warehouse`
+  column in your `Machines` tab exactly, so no location-matching is
+  needed here — unlike the Margin/COGS and Customer Complaints
+  features, this one didn't need a fuzzy-matching layer.
+- The tab has two parts. **Current Inventory (estimated)** comes
+  first: a running balance per warehouse × product, always over the
+  *full* stock-in history (never the sidebar's date range — a balance
+  isn't a period total). If the `Refill_Product` tab has usable rows
+  (`warehouse` / `product_name` / `refill_qty`), it's cumulative stock
+  in **minus** cumulative refills out, matched by warehouse + a
+  normalized product name; otherwise (its current state — that tab is
+  empty) it falls back to cumulative stock-in only. **Either way, a
+  prominent caveat banner says exactly which basis is in use and what
+  it doesn't account for**: any stock a warehouse held before this log
+  started, a refill that didn't match by name, and anything moved by
+  something other than a logged refill (damage, loss, direct sales). A
+  negative estimate is flagged as a sign of one of those gaps, not
+  shown as if it were real negative stock.
+- **Stock-In Detail** is the second part (the tab as originally
+  built): packets stocked in by warehouse (table + chart), a daily
+  stock-in trend stacked by warehouse, a per-warehouse drill-down (top
+  products stocked, full delivery log), and a visible count of delivery
+  lines the sheet itself flagged as missing a product code (its
+  `Agent notes` column says to add one to `Product_Alias_Map`) — shown
+  rather than silently dropped. This part respects the sidebar's date
+  range only, not City/Machine — stock-in is recorded per warehouse,
+  and one warehouse can feed machines across more than one city.
+- Leave this out and the Inventory tab shows a message instead of
+  erroring; everything else is unaffected.
+
+---
+
 ## 2. Run it locally first (recommended before deploying)
 
 Open a terminal in this folder and run:
@@ -411,6 +459,15 @@ machine isn't understated.
   filterable complaint log, the sheet's own repeat-complaint-by-product
   rollup, weekly refund-rate-vs-budget by location, and an unrecognized-
   machine list — see "Optional: Customer Complaints" above
+- **Inventory tab:** two parts, see "Optional: Inventory" above.
+  **Current Inventory (estimated)** — a per-warehouse-×-product
+  running balance over the full stock-in history, with a prominent
+  caveat banner on exactly what it does and doesn't account for (not
+  affected by the sidebar filters). **Stock-In Detail** below it
+  respects the sidebar's date range only (see why above): packets
+  stocked in by warehouse, a daily stock-in trend, a per-warehouse
+  drill-down (top products, full delivery log), and a flagged count of
+  delivery lines missing a product code
 - **Accounts tab:** bank ledger KPIs, P&L snapshot and waterfall, cash
   flow analytics, full transaction log — reads the separate accounts
   sheet (see "Optional: Accounts / HR tabs" above)

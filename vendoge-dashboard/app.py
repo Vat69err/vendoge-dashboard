@@ -723,6 +723,50 @@ def match_complaints_to_machines(complaints_df: pd.DataFrame, machines_lookup: p
 
 
 # ============================================================
+# 2f. INVENTORY — manual stock-in log (Vendekin Snacks warehouses)
+# ============================================================
+INVENTORY_SHEET_ID = st.secrets.get("sheets", {}).get("inventory")
+INVENTORY_STOCK_IN_GID = (
+    str(st.secrets.get("gids", {}).get("inventory", {}).get("stock_in", ""))
+    if INVENTORY_SHEET_ID else ""
+)
+
+
+def _inventory_csv_url(gid: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{INVENTORY_SHEET_ID}/export?format=csv&gid={gid}"
+
+
+@st.cache_data(ttl=300, show_spinner="Pulling latest inventory stock-in data...")
+def load_stock_in() -> pd.DataFrame:
+    df = pd.read_csv(_inventory_csv_url(INVENTORY_STOCK_IN_GID))
+    df["Date"] = pd.to_datetime(df.get("Date"), errors="coerce")
+    _to_num(df, ["Stock Qty (packets)", "Margin sheet row"])
+    _to_str_id(df, "Product Code")
+    if "Distributor" in df.columns:
+        # the sheet mixes casing for the same real distributor ("VIKRAM TRADERS" vs
+        # "Vikram Traders") -- normalize so a by-distributor grouping doesn't fragment.
+        df["Distributor"] = df["Distributor"].astype(str).str.strip().str.upper()
+    return df
+
+
+if INVENTORY_SHEET_ID and INVENTORY_STOCK_IN_GID:
+    try:
+        stock_in_df = load_stock_in()
+        INVENTORY_LOAD_ERROR = None
+    except Exception as e:
+        stock_in_df = pd.DataFrame()
+        INVENTORY_LOAD_ERROR = f"Couldn't load the Inventory stock-in sheet.\n\nTechnical detail: {e}"
+else:
+    stock_in_df = pd.DataFrame()
+    INVENTORY_LOAD_ERROR = (
+        "Missing secrets! This needs `[sheets] inventory` (the sheet ID) and "
+        "`[gids.inventory] stock_in` (the tab's gid) set up in Streamlit secrets."
+    )
+
+INVENTORY_DATA_OK = INVENTORY_LOAD_ERROR is None and not stock_in_df.empty
+
+
+# ============================================================
 # SHARED: per-hour actual-vs-baseline helpers (machine quiet / failure-spike checks)
 # ============================================================
 def _baseline_hourly_median(scope_df: pd.DataFrame, baseline_start, baseline_end, max_hour: int,
@@ -1133,10 +1177,10 @@ def render_vendekin_snacks():
     # 6. TABS
     # ============================================================
     (tab_overview, tab_attention, tab_today, tab_revenue, tab_refill, tab_failures, tab_sku,
-     tab_machines, tab_outliers, tab_margin, tab_complaints, tab_accounts, tab_hr) = st.tabs([
+     tab_machines, tab_outliers, tab_margin, tab_complaints, tab_inventory, tab_accounts, tab_hr) = st.tabs([
         "📊 Overview", "🚨 Needs Attention", "📅 Today", "💰 Revenue & Sales", "🔁 Refilling",
         "🚫 Failures", "🧃 SKU Mix", "🖥️ Machines", "⚠️ Outliers", "📈 Margin & COGS",
-        "📣 Customer Complaints", "💳 Accounts", "👥 HR",
+        "📣 Customer Complaints", "📦 Inventory", "💳 Accounts", "👥 HR",
     ])
 
     # ---------- OVERVIEW ----------
@@ -2210,6 +2254,187 @@ def render_vendekin_snacks():
                     location_budget.sort_values(["Week", "Refund rate"], ascending=[False, False]),
                     use_container_width=True, hide_index=True,
                 )
+
+    with tab_inventory:
+        st.subheader("📦 Inventory")
+
+        if not INVENTORY_DATA_OK:
+            st.warning(f"Inventory data isn't loaded ({INVENTORY_LOAD_ERROR}).")
+        else:
+            # ============================================================
+            # CURRENT INVENTORY — a cumulative-balance estimate, so it always
+            # uses the FULL stock-in history, never the sidebar's date range
+            # (a running balance isn't a period metric).
+            # ============================================================
+            st.markdown("### 📊 Current Inventory — Warehouse-wise (Estimated)")
+
+            tracking_since = stock_in_df["Date"].min()
+            tracking_asof = stock_in_df["Date"].max()
+
+            inv = stock_in_df.groupby(["Warehouse", "Product Name"], as_index=False)["Stock Qty (packets)"].sum()
+            inv = inv.rename(columns={"Stock Qty (packets)": "Cumulative Stock In"})
+
+            refill_product_df = data["refill_product"]
+            _required_rp_cols = {"warehouse", "product_name", "refill_qty"}
+            refill_usable = not refill_product_df.empty and _required_rp_cols.issubset(refill_product_df.columns)
+
+            if refill_usable:
+                rp_agg = refill_product_df.groupby(["warehouse", "product_name"], as_index=False)["refill_qty"].sum()
+                rp_agg["_norm_prod"] = rp_agg["product_name"].apply(_sku_basic_norm)
+                inv["_norm_prod"] = inv["Product Name"].apply(_sku_basic_norm)
+                inv = inv.merge(
+                    rp_agg[["warehouse", "_norm_prod", "refill_qty"]].rename(columns={"warehouse": "Warehouse"}),
+                    on=["Warehouse", "_norm_prod"], how="left",
+                ).drop(columns="_norm_prod")
+                inv["refill_qty"] = inv["refill_qty"].fillna(0)
+                inv = inv.rename(columns={"refill_qty": "Cumulative Refilled Out"})
+                inv["Current Inventory (est.)"] = inv["Cumulative Stock In"] - inv["Cumulative Refilled Out"]
+                st.info(
+                    f"📌 **How this is calculated:** cumulative packets stocked in, minus cumulative packets "
+                    f"refilled out to machines (matched by warehouse + product name), tracked since "
+                    f"**{tracking_since.date()}** (as of **{tracking_asof.date()}**).\n\n"
+                    "**Caveats:** doesn't include any stock a warehouse already held *before* "
+                    f"{tracking_since.date()}; only subtracts refills matched by product name, so a naming "
+                    "mismatch between the stock-in log and the refill log would overstate that product's "
+                    "inventory; and doesn't account for damage, loss, or stock moved by anything other than a "
+                    "logged refill. Treat this as an informed estimate, not a verified physical count — "
+                    "negative values below are a sign of one of these gaps, not a real negative stock."
+                )
+            else:
+                inv["Cumulative Refilled Out"] = pd.NA
+                inv["Current Inventory (est.)"] = inv["Cumulative Stock In"]
+                st.warning(
+                    "⚠️ **No usable product-level refill/consumption data yet** (the `Refill_Product` tab is "
+                    "empty or not in the expected shape), so the figures below are **cumulative stock-in "
+                    f"only** — tracked since **{tracking_since.date()}**, as of **{tracking_asof.date()}** — "
+                    "and do **not** subtract anything already refilled into machines. Treat this as an upper "
+                    "bound on current stock, not an actual balance, until refill data is wired up."
+                )
+
+            inv_by_wh = inv.groupby("Warehouse", as_index=False)["Current Inventory (est.)"].sum().sort_values(
+                "Current Inventory (est.)", ascending=False
+            )
+            fig_inv = px.bar(
+                inv_by_wh.sort_values("Current Inventory (est.)"), x="Current Inventory (est.)", y="Warehouse",
+                orientation="h", title="Estimated Current Inventory by Warehouse (packets)",
+                color_discrete_sequence=[ACCENT],
+            )
+            fig_inv.update_layout(xaxis_title="Packets", yaxis_title="")
+            st.plotly_chart(fig_inv, use_container_width=True)
+
+            inv_wh_choice = st.selectbox("Warehouse", inv_by_wh["Warehouse"].tolist(), key="inventory_current_warehouse")
+            inv_detail = inv[inv["Warehouse"] == inv_wh_choice].sort_values("Current Inventory (est.)", ascending=False)
+
+            if refill_usable:
+                negative_rows = inv_detail[inv_detail["Current Inventory (est.)"] < 0]
+                if not negative_rows.empty:
+                    st.caption(
+                        f"⚠️ {len(negative_rows)} product(s) here show more refilled out than ever stocked "
+                        "in — likely a product-name mismatch between the two sheets, or stock-in that "
+                        "predates this tracking log. Shown as-is below, not hidden."
+                    )
+                _inv_cols = ["Product Name", "Cumulative Stock In", "Cumulative Refilled Out", "Current Inventory (est.)"]
+            else:
+                _inv_cols = ["Product Name", "Cumulative Stock In", "Current Inventory (est.)"]
+            st.dataframe(inv_detail[_inv_cols], use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # ============================================================
+            # STOCK-IN DETAIL — the delivery log itself, respects the sidebar's date range.
+            # ============================================================
+            st.markdown("### 📥 Stock-In Detail")
+            st.caption(
+                "From the manual stock-in log. Respects the sidebar's date range; not filtered "
+                "by City/Machine since stock-in is recorded per warehouse, which can feed several "
+                "machines across more than one city."
+            )
+
+            si = stock_in_df[
+                (stock_in_df["Date"].dt.date >= start_date) & (stock_in_df["Date"].dt.date <= end_date)
+            ]
+            if si.empty:
+                st.info("No stock-in records for the current date range.")
+            else:
+                needs_code = si[si["Agent notes"] == "Product code not found - add it in Product_Alias_Map"]
+
+                k1, k2, k3, k4, k5 = st.columns(5)
+                k1.metric("Packets Stocked In", f"{si['Stock Qty (packets)'].sum():,.0f}")
+                k2.metric("Warehouses", si["Warehouse"].nunique())
+                k3.metric("Distinct Products", si["Product Name"].nunique())
+                k4.metric("Deliveries", len(si))
+                k5.metric("Needs Product Code", len(needs_code))
+
+                st.divider()
+                st.subheader("By Warehouse")
+                by_wh = si.groupby("Warehouse", as_index=False).agg(
+                    packets=("Stock Qty (packets)", "sum"),
+                    deliveries=("Stock Qty (packets)", "size"),
+                    distinct_products=("Product Name", "nunique"),
+                    first_stock_in=("Date", "min"),
+                    last_stock_in=("Date", "max"),
+                ).sort_values("packets", ascending=False)
+
+                fig_wh = px.bar(
+                    by_wh.sort_values("packets"), x="packets", y="Warehouse", orientation="h",
+                    title="Packets Stocked In by Warehouse", color_discrete_sequence=[PRIMARY],
+                )
+                fig_wh.update_layout(xaxis_title="Packets", yaxis_title="")
+                st.plotly_chart(fig_wh, use_container_width=True)
+
+                st.dataframe(
+                    by_wh.rename(columns={
+                        "packets": "Packets", "deliveries": "Deliveries",
+                        "distinct_products": "Distinct Products",
+                        "first_stock_in": "First Stock-In", "last_stock_in": "Last Stock-In",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+
+                st.divider()
+                st.subheader("Stock-In Trend")
+                daily_wh = si.groupby([si["Date"].dt.date, "Warehouse"], as_index=False)["Stock Qty (packets)"].sum()
+                daily_wh.columns = ["date", "Warehouse", "packets"]
+                fig_trend = px.bar(
+                    daily_wh, x="date", y="packets", color="Warehouse", barmode="stack",
+                    title="Daily Packets Stocked In by Warehouse", color_discrete_sequence=PALETTE,
+                )
+                fig_trend.update_layout(xaxis_title="", yaxis_title="Packets", legend_title="")
+                st.plotly_chart(fig_trend, use_container_width=True)
+
+                st.divider()
+                st.subheader("Drill Into One Warehouse")
+                wh_choice = st.selectbox("Warehouse", by_wh["Warehouse"].tolist(), key="inventory_warehouse")
+                wh_rows = si[si["Warehouse"] == wh_choice]
+
+                top_products = (
+                    wh_rows.groupby("Product Name", as_index=False)["Stock Qty (packets)"].sum()
+                    .sort_values("Stock Qty (packets)", ascending=False).head(15)
+                )
+                fig_prod = px.bar(
+                    top_products.sort_values("Stock Qty (packets)"), x="Stock Qty (packets)", y="Product Name",
+                    orientation="h", title=f"Top Products Stocked In — {wh_choice}",
+                    color_discrete_sequence=[ACCENT],
+                )
+                fig_prod.update_layout(xaxis_title="Packets", yaxis_title="")
+                st.plotly_chart(fig_prod, use_container_width=True)
+
+                st.dataframe(
+                    wh_rows.sort_values("Date", ascending=False)[[
+                        "Date", "Product Name", "Stock Qty (packets)", "Invoice No.", "Distributor", "Machine IDs",
+                    ]].rename(columns={"Stock Qty (packets)": "Packets"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+                if not needs_code.empty:
+                    with st.expander(
+                        f"⚠️ {len(needs_code)} delivery line(s) with no product code "
+                        "(needs a Product_Alias_Map entry)"
+                    ):
+                        st.dataframe(
+                            needs_code[["Date", "Warehouse", "Product Name", "Stock Qty (packets)", "Invoice No."]],
+                            use_container_width=True, hide_index=True,
+                        )
 
     with tab_accounts:
         st.subheader("💳 Accounts Ledger")
